@@ -1,0 +1,6 @@
+# dsh-unity-pool 宿主插件：会话级 Unity 服务池连接管理。
+# 每个 DSH 会话独立绑定一个 Unity 服务（mcp-for-unity 端点）；
+# 提供 unity_pool_status / unity_pool_bind / unity_pool_unbind 工具 + 会话头部 Unity 状态面板。
+- insert:
+    - id: unity-pool
+      name: 'dsh-unity-pool'

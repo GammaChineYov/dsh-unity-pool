@@ -1,0 +1,113 @@
+# dsh-unity-pool v2 — 会话级 Unity 服务池 + 实例级 MCP 代理
+
+DSH 插件：解决「同一 DSH 终端（web）里多个会话各连各的 Unity 实例」的问题。
+
+**核心思路**：mcp-for-unity 的 HTTP 模式把「当前激活实例」按 **MCP-Session-Id 隔离**——插件为每个 DSH 会话维护独立的 MCP 会话（独立 session id），
+再通过 `unity_mcp` 代理在调用前自动 `set_active_instance` 到本会话锁定的目标实例。因此**同一服务上不同会话可以同时 target 不同实例，互不干扰，无需全局切换/排队**。
+
+## 与官方 Unity MCP 的关系
+
+- 官方 Unity MCP（CoplayDev/unity-mcp）= 能力层：把 Unity 编辑器翻译成 MCP 工具/资源；
+- 本插件 = 调度层：服务池发现 + 实例发现 + 会话目标实例锁定 + MCP 调用代理；
+- 两者叠加：官方负责「能干 Unity 的活」，插件负责「这个会话连哪个实例」。
+
+## 数据模型
+
+```
+服务（Service）＝ 一个 mcp-for-unity server（一个端口，如 8080）
+  └ 实例（Instance）＝ 一个已连接的 Unity 编辑器（Name@hash，如 ProjA@aaaa1111）
+会话锁定（Binding）＝ sessionId → { serviceId, instanceId }
+MCP 会话（Session）＝ 每 DSH 会话 × 服务 一个独立 Mcp-Session-Id（active 实例按 session 隔离）
+```
+
+## 工作流（对应需求流程）
+
+1. 会话被告知要处理的服务（8080/8081）或目标工程 → 调 `unity_pool_status`；
+2. 目标实例不在列表 → `unity_pool_scan`（服务重探 + 实例重读 + 扫描 scanPorts 端口段发现新服务）→ 再 `unity_pool_status`；
+3. 列表含多个实例（如 A/B 在 S1、C 在 S2）→ 调 `unity_pool_bind(instance="ProjB@bbbb2222")` 把本会话目标实例锁定为 B；
+4. 之后所有 MCP 操作走 `unity_mcp(tool=..., params=...)`——插件自动把本会话的 MCP 会话激活到 B（助手无感），转发 tools/call；
+5. 另一个会话锁 A 并行工作：per MCP-Session-Id 隔离，两会话各自 target 各自实例，互不干扰；
+6. 用完 `unity_pool_unbind` 释放。
+
+> 关于「切换/排队」：官方 HTTP 模式 active 实例按 session 隔离（见 `test_multi_user_session_isolation.py`），
+> 所以不需要「服务级全局切换 + 互斥等待」。同一实例被多会话并发调用时由 Unity 侧单线程排队（官方文档所述，性能排队而非错误）。
+
+## 架构
+
+```
+浏览器端（client）                          Node 宿主（host）
+conversation.session.header.utilities       UnityPool（服务池+实例缓存+会话绑定+探活）
+  └ Unity 胶囊+面板 ──fetch──>  /unity-pool/api/*（回环）
+                                ├ unity_pool_status / unity_pool_scan / unity_pool_bind
+                                ├ unity_mcp（代理）──> McpHttpClient（per-session MCP 会话）
+                                │                          └ set_active_instance + tools/call
+                                └ unity_pool_unbind
+                                      持久化：~/.dsh/unity-pool-state.json
+```
+
+- 宿主 `lib/index.js`：cordis 插件，`inject: ['tools','webServer','systemPrompt']`；
+- MCP 客户端 `lib/mcp-client.js`：streamable-HTTP 薄封装（initialize / resources/read / tools/call，SSE+JSON，per-client 串行）；
+- 客户端 `lib/client.js`：`conversation.session.header.utilities` 槽（id `unity-pool`，order 110）。
+
+## 安装
+
+```powershell
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-unity-pool" -Target "C:\Users\PC\dsh-unity-pool" -Force
+New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Target "C:\Users\PC\.dsh\profiles\node_modules" -Force
+```
+
+- `~/.dsh/profiles/web/package.json`：`dependencies` 加 `"dsh-unity-pool": "link:C:/Users/PC/dsh-unity-pool"`，`dsh.profile.bundles` 加 `"dsh-unity-pool"`（无 BOM）；
+- `~/.dsh/profiles/web/cordis.patch.yml` 加配置段（见下）；
+- **重启 `dsh web` 生效**；验证 `dsh --profile web --dump-config | grep unity-pool`。
+
+## 配置（cordis.patch.yml）
+
+```yaml
+- id: unity-pool
+  config:
+    services:                 # 服务池：每个 mcp-for-unity server 一个条目
+      - id: unity-e-line
+        name: 'E线-8080'
+        url: 'http://127.0.0.1:8080/mcp'
+      - id: unity-8081
+        name: 'Unity-8081'
+        url: 'http://127.0.0.1:8081/mcp'
+    probeIntervalMs: 8000     # 探活+实例发现间隔（ms）
+    probeTimeoutMs: 3000      # 单次 MCP 请求超时（ms）
+    scanPorts: [8080, 8081, 8082, 8083, 8084, 8090]   # unity_pool_scan 自动扫描的端口段
+    autoAssign: true          # 未指定实例时自动分配未被其他会话锁定的实例
+    enforceExclusive: true    # 同一实例默认不能被第二个会话锁定
+    connectHint: '调用 unity_mcp(tool=..., params=...) 代理 MCP 工具调用'
+```
+
+## Agent 工具
+
+| 工具 | 作用 |
+|------|------|
+| `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活）+ 本会话锁定 |
+| `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务 |
+| `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他） |
+| `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发） |
+| `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话 |
+
+`unity_mcp` 参数：`tool`（mcp-for-unity 工具名，如 manage_scene / manage_gameobject / manage_camera / read_console）、`params`（工具参数对象）、`instance`（可选临时覆盖）。
+
+## HTTP API（回环，仅 127.0.0.1/localhost）
+
+- `GET /unity-pool/api/status?sessionId=<id>` —— 服务/实例/绑定视图；
+- `GET /unity-pool/api/config` —— 池配置与提示；
+- `POST /unity-pool/api/scan` `{sessionId}` —— 重探+扫描；
+- `POST /unity-pool/api/bind` `{sessionId, instance?, serviceId?, force?}` —— 锁定目标实例；
+- `POST /unity-pool/api/unbind` `{sessionId}` —— 释放。
+
+## 测试
+
+```powershell
+node "C:\Users\PC\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 27 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/scan/持久化/工具/HTTP
+```
+
+## 变更日志
+
+- `0.1.0` v1：会话→服务绑定 + 探活 + 面板；
+- `0.2.0` v2：实例级——实例发现、会话目标实例锁定、`unity_mcp` 代理（per MCP-Session-Id 隔离）、`unity_pool_scan`；
+- `0.3.0` v3：客户端**全行内样式**（不再注入全局 `<style>`，避免影响其它客户端插件样式；弹窗改为贴近按钮、无遮罩、toggle 开关）。
