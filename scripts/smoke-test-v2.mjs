@@ -19,8 +19,15 @@ function check(name, cond, detail) {
 // ---------- mock mcp-for-unity server ----------
 function makeMcpServer(instances, opts = {}) {
   // instances: [{id, name, hash}]; opts.failToolsList: true 时 tools/list 报错
+  // opts.toolDefs: 初始工具定义数组（可随后 addTool 动态增删）
   const sessions = new Map() // sessionId -> { active: string|null }
   const calls = []           // {sessionId, active, tool, args}
+  const tools = opts.toolDefs ? JSON.parse(JSON.stringify(opts.toolDefs)) : [
+    { name: 'manage_scene', description: '场景操作（get_hierarchy 等）', inputSchema: { type: 'object', properties: { action: { type: 'string' } } } },
+    { name: 'manage_gameobject', description: 'GameObject 操作', inputSchema: { type: 'object', properties: { action: { type: 'string' }, name: { type: 'string' } } } },
+    { name: 'read_console', description: '读控制台', inputSchema: { type: 'object', properties: { count: { type: 'number' } } } },
+  ]
+  let listCalls = 0
   let nextSession = 1
   const server = http.createServer(async (req, res) => {
     let body = ''
@@ -50,13 +57,8 @@ function makeMcpServer(instances, opts = {}) {
       return
     }
     if (method === 'tools/list') {
-      result = {
-        tools: [
-          { name: 'manage_scene', description: '场景操作（get_hierarchy 等）', inputSchema: { type: 'object', properties: { action: { type: 'string' } } } },
-          { name: 'manage_gameobject', description: 'GameObject 操作', inputSchema: { type: 'object', properties: { action: { type: 'string' }, name: { type: 'string' } } } },
-          { name: 'read_console', description: '读控制台', inputSchema: { type: 'object', properties: { count: { type: 'number' } } } },
-        ],
-      }
+      listCalls++
+      result = { tools: JSON.parse(JSON.stringify(tools)) }
     } else if (method === 'resources/read' && msg.params && msg.params.uri === 'mcpforunity://instances') {
       result = {
         contents: [{ type: 'text', text: JSON.stringify({ success: true, transport: 'http', instance_count: instances.length, instances }) }],
@@ -77,6 +79,14 @@ function makeMcpServer(instances, opts = {}) {
         calls.push({ sessionId: sid, active: st.active, tool: name, args })
         if (!st.active) {
           result = { isError: true, content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'no active instance; available: ' + instances.map(i => i.id).join(',') }) }] }
+        } else if (name === 'manage_camera' && args.action === 'screenshot') {
+          // 模拟官方 manage_camera include_image=true 的 ImageContent 块
+          result = {
+            content: [
+              { type: 'text', text: JSON.stringify({ success: true, data: { width: 640, height: 480 } }) },
+              { type: 'image', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', mimeType: 'image/png' },
+            ],
+          }
         } else {
           result = { content: [{ type: 'text', text: JSON.stringify({ ok: true, active: st.active, tool: name, args }) }] }
         }
@@ -87,7 +97,11 @@ function makeMcpServer(instances, opts = {}) {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }))
   })
-  return { server, sessions, calls, listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close() }
+  return {
+    server, sessions, calls, tools, listCalls: () => listCalls,
+    addTool(name) { if (!tools.some(t => t.name === name)) tools.push({ name, description: 'dynamic tool', inputSchema: { type: 'object', properties: {} } }) },
+    listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close(),
+  }
 }
 
 const s1 = makeMcpServer([
@@ -174,6 +188,45 @@ let noBind = null
 try { await pool.proxyMcp('sess-NO', 'manage_scene', {}) } catch (e) { noBind = e.message }
 check('未锁定实例调用 unity_mcp 被拒', /unity_pool_bind/.test(noBind || ''), noBind)
 
+// ---------- 轻量一致性：缓存外工具自动重拉 tools/list ----------
+const listCallsBefore = s1.listCalls()
+s1.addTool('gfind') // Unity 运行时新注册的自定义工具（首次绑定时不存在）
+const rg = await pool.proxyMcp('sess-X', 'gfind', { pattern: 'Cube' })
+check('缓存外工具自动重拉 tools/list 后调用成功', rg.success === true && rg.tool === 'gfind', JSON.stringify(rg).slice(0, 200))
+check('缓存外工具触发重拉（listCalls +1）', s1.listCalls() === listCallsBefore + 1, 'listCalls=' + s1.listCalls())
+
+const listCallsBefore2 = s1.listCalls()
+await pool.proxyMcp('sess-X', 'manage_scene', { action: 'get_hierarchy' })
+check('缓存内工具不触发重拉', s1.listCalls() === listCallsBefore2, 'listCalls=' + s1.listCalls())
+
+// ---------- 图片内容块占位（manage_camera include_image=true） ----------
+const shot = await pool.proxyMcp('sess-X', 'manage_camera', { action: 'screenshot' })
+check('image 内容块以占位标记出现（不静默丢弃）', /\[image: image\/png/.test(shot.text), shot.text.slice(0, 200))
+
+// ---------- 全量 53 工具逐一经代理（对照官方 tools/list，验证无缺失） ----------
+const OFFICIAL_TOOLS = ['batch_execute','debug_request_context','execute_code','execute_custom_tool','execute_menu_item','find_gameobjects','find_in_file','generate_audio','generate_image','generate_model','import_model','import_model_file','manage_animation','manage_asset','manage_build','manage_camera','manage_components','manage_editor','manage_gameobject','manage_graphics','manage_material','manage_packages','manage_physics','manage_prefabs','manage_probuilder','manage_profiler','manage_scene','refresh_unity','apply_text_edits','create_script','delete_script','validate_script','manage_script','manage_script_capabilities','get_sha','manage_scriptable_object','manage_shader','manage_texture','manage_tools','manage_ui','manage_vfx','read_console','run_tests','get_test_job','script_apply_edits','set_active_instance','unity_docs','unity_reflect','gcall','gmouse','gfind','gset','project_search']
+check('官方工具名清单 53 个', OFFICIAL_TOOLS.length === 53, String(OFFICIAL_TOOLS.length))
+const s5 = makeMcpServer([{ id: 'ProjF@ffff6666', name: 'ProjF', hash: 'ffff6666' }], {
+  toolDefs: OFFICIAL_TOOLS.map(n => ({ name: n, description: 'official tool ' + n, inputSchema: { type: 'object', properties: { action: { type: 'string' } } } })),
+})
+await s5.listen()
+const pool5 = createPool(ctx, {
+  services: [{ id: 'S5', name: '服务5', url: 'http://127.0.0.1:' + s5.port() + '/mcp' }],
+  dataFile: dataFile + '.s5',
+  probeIntervalMs: 5000,
+})
+await pool5.probe()
+await pool5.bind('sess-F')
+let missing = []
+for (const name of OFFICIAL_TOOLS) {
+  try {
+    const r = await pool5.proxyMcp('sess-F', name, { action: 'ping' })
+    if (!r.success) missing.push(name + ':' + JSON.stringify(r.text).slice(0, 60))
+  } catch (e) { missing.push(name + ':throw:' + String(e.message || e).slice(0, 60)) }
+}
+check('53 个官方工具逐一经 unity_mcp 代理全部成功（无缺失）', missing.length === 0, missing.join('; ').slice(0, 400))
+pool5.stop()
+
 // ---------- scan ----------
 const s3 = makeMcpServer([{ id: 'ProjD@dddd4444', name: 'ProjD', hash: 'dddd4444' }])
 await s3.listen()
@@ -201,7 +254,7 @@ check('sess-X 重复绑定（换实例）不返回工具列表', bX2.instanceId 
 // 解绑后重新绑定 = 该会话的又一次首次绑定 → 重新拉取工具列表
 await pool.unbind('sess-X')
 const bX3 = await pool.bind('sess-X', { instance: 'ProjA@aaaa1111', force: true })
-check('解绑后重新绑定再次返回工具列表', Array.isArray(bX3.tools) && bX3.toolsCount === 3 && bX3.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX3.tools).slice(0, 200))
+check('解绑后重新绑定再次返回工具列表', Array.isArray(bX3.tools) && bX3.toolsCount >= 3 && bX3.tools.some(t => t.name === 'manage_scene') && bX3.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX3.tools).slice(0, 200))
 
 // ---------- apply() 装配 ----------
 const routes = []
@@ -225,7 +278,7 @@ await registered.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { 
 const bindTool = registered.find(t => t.name === 'unity_pool_bind')
 const bindRes = await bindTool.execute({ instance: 'ProjB@bbbb2222' }, { agent: { id: 'sess-T' } })
 check('工具 unity_pool_bind 锁定 ProjB', bindRes.instanceId === 'ProjB@bbbb2222')
-check('工具 unity_pool_bind 首次绑定附带工具列表', Array.isArray(bindRes.tools) && bindRes.toolsCount === 3 && bindRes.tools[0].name === 'manage_scene', JSON.stringify(bindRes.tools).slice(0, 200))
+check('工具 unity_pool_bind 首次绑定附带工具列表', Array.isArray(bindRes.tools) && bindRes.toolsCount >= 3 && bindRes.tools.some(t => t.name === 'manage_scene'), JSON.stringify(bindRes.tools).slice(0, 200))
 
 const mcpTool = registered.find(t => t.name === 'unity_mcp')
 const mcpRes = await mcpTool.execute({ tool: 'manage_camera', params: { action: 'screenshot' } }, { agent: { id: 'sess-T' } })
@@ -274,9 +327,10 @@ check('tools/list 失败时绑定仍成功', b4.instanceId === 'ProjE@eeee5555',
 check('tools/list 失败附带 toolsError', Array.isArray(b4.tools) && b4.toolsCount === 0 && /tools\/list boom/.test(b4.toolsError || ''), JSON.stringify(b4.toolsError))
 pool4.stop()
 
-s1.close(); s2.close(); s3.close(); s4.close()
+s1.close(); s2.close(); s3.close(); s4.close(); s5.close()
 fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
 fsp.rm(dataFile + '.apply', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.s4', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.s5', { force: true }).catch(() => {})
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILURES: ' + failures)
 process.exit(failures === 0 ? 0 : 1)

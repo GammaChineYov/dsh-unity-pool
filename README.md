@@ -103,7 +103,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\PC\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 27 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/scan/持久化/工具/HTTP
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 42 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
@@ -112,3 +112,4 @@ node "C:\Users\PC\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 27 项：mock mc
 - `0.2.0` v2：实例级——实例发现、会话目标实例锁定、`unity_mcp` 代理（per MCP-Session-Id 隔离）、`unity_pool_scan`；
 - `0.3.0` v3：客户端**全行内样式**（不再注入全局 `<style>`，避免影响其它客户端插件样式；弹窗改为贴近按钮、无遮罩、toggle 开关）。
 - `0.3.1` **首次绑定返回工具列表**：`unity_pool_bind` 改为 async，会话首次绑定时（此前未锁定过）自动拉取目标服务上的 MCP 工具列表（`tools/list`），随结果返回 `tools`（含 name/description/inputSchema）与 `toolsCount`；拉取失败不阻断绑定（附 `toolsError`）。
+- `0.3.2` **动态工具集合对齐 + 内容占位**：① 轻量一致性——`unity_mcp` 请求的工具不在缓存列表时自动重拉一次 `tools/list` 再转发（官方工具集合动态增减：Unity 自定义工具注册/`manage_tools` 组开关），重拉失败不阻断；② `image/audio/resource` 内容块不再静默丢弃，text 输出以 `[image: image/png, 内容已丢弃（文本通道）]` 占位（与官方 dsh-mcp-client 桥行为一致，对应 `manage_camera include_image=true` 场景）。
