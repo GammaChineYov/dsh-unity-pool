@@ -86,7 +86,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 |------|------|
 | `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活）+ 本会话锁定 |
 | `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务 |
-| `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**首次绑定或跨服务切换时返回该服务 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**，拉取失败附 `toolsError` 不阻断绑定 |
+| `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**首次绑定或跨服务切换时返回该服务 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**，拉取失败附 `toolsError` 不阻断绑定；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
 | `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃） |
 | `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话 |
 
@@ -114,3 +114,4 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 44 项：mo
 - `0.3.1` **首次绑定返回工具列表**：`unity_pool_bind` 改为 async，会话首次绑定时（此前未锁定过）自动拉取目标服务上的 MCP 工具列表（`tools/list`），随结果返回 `tools`（含 name/description/inputSchema）与 `toolsCount`；拉取失败不阻断绑定（附 `toolsError`）。
 - `0.3.2` **动态工具集合对齐 + 内容占位**：① 轻量一致性——`unity_mcp` 请求的工具不在缓存列表时自动重拉一次 `tools/list` 再转发（官方工具集合动态增减：Unity 自定义工具注册/`manage_tools` 组开关），重拉失败不阻断；② `image/audio/resource` 内容块不再静默丢弃，text 输出以 `[image: image/png, 内容已丢弃（文本通道）]` 占位（与官方 dsh-mcp-client 桥行为一致，对应 `manage_camera include_image=true` 场景）。
 - `0.3.3` **跨服务切换重拉工具列表 + 描述同步**：`unity_pool_bind` 在会话切换到另一服务（serviceId 变化）时同样重拉 `tools/list` 随结果返回（不同 mcp-for-unity server 工具集可能不同）；工具描述、系统提示指南、README（工作流/工具表/HTTP API）同步说明首次绑定/跨服务返回 tools、动态重拉、图片占位。
+- `0.3.4` **服务级并集说明**：工具列表为服务级并集（同服务多工程实例的自定义工具合并列出）——工具描述、系统提示指南、README 补充说明，避免把其他工程实例的自定义工具误当作当前实例可用（导包迁移任务双工程同服务场景实测）。
