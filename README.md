@@ -111,3 +111,4 @@ node "C:\Users\PC\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 27 项：mock mc
 - `0.1.0` v1：会话→服务绑定 + 探活 + 面板；
 - `0.2.0` v2：实例级——实例发现、会话目标实例锁定、`unity_mcp` 代理（per MCP-Session-Id 隔离）、`unity_pool_scan`；
 - `0.3.0` v3：客户端**全行内样式**（不再注入全局 `<style>`，避免影响其它客户端插件样式；弹窗改为贴近按钮、无遮罩、toggle 开关）。
+- `0.3.1` **首次绑定返回工具列表**：`unity_pool_bind` 改为 async，会话首次绑定时（此前未锁定过）自动拉取目标服务上的 MCP 工具列表（`tools/list`），随结果返回 `tools`（含 name/description/inputSchema）与 `toolsCount`；拉取失败不阻断绑定（附 `toolsError`）。

@@ -4,7 +4,9 @@ import * as fsp from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
 
-const PLUGIN = 'file:///' + path.join(os.homedir(), '.dsh', 'profiles', 'web', 'node_modules', 'dsh-unity-pool', 'lib', 'index.js').replace(/\\/g, '/')
+const PLUGIN = process.env.UNITY_POOL_LIB
+  ? 'file:///' + process.env.UNITY_POOL_LIB.replace(/\\/g, '/')
+  : 'file:///' + path.join(os.homedir(), '.dsh', 'profiles', 'web', 'node_modules', 'dsh-unity-pool', 'lib', 'index.js').replace(/\\/g, '/')
 const mod = await import(PLUGIN)
 const { UnityPool, createPool, apply, Config } = mod
 
@@ -15,8 +17,8 @@ function check(name, cond, detail) {
 }
 
 // ---------- mock mcp-for-unity server ----------
-function makeMcpServer(instances) {
-  // instances: [{id, name, hash}]
+function makeMcpServer(instances, opts = {}) {
+  // instances: [{id, name, hash}]; opts.failToolsList: true 时 tools/list 报错
   const sessions = new Map() // sessionId -> { active: string|null }
   const calls = []           // {sessionId, active, tool, args}
   let nextSession = 1
@@ -42,7 +44,20 @@ function makeMcpServer(instances) {
     }
     const st = sessions.get(sid)
     let result
-    if (method === 'resources/read' && msg.params && msg.params.uri === 'mcpforunity://instances') {
+    if (method === 'tools/list' && opts.failToolsList) {
+      res.writeHead(500, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'tools/list boom' } }))
+      return
+    }
+    if (method === 'tools/list') {
+      result = {
+        tools: [
+          { name: 'manage_scene', description: '场景操作（get_hierarchy 等）', inputSchema: { type: 'object', properties: { action: { type: 'string' } } } },
+          { name: 'manage_gameobject', description: 'GameObject 操作', inputSchema: { type: 'object', properties: { action: { type: 'string' }, name: { type: 'string' } } } },
+          { name: 'read_console', description: '读控制台', inputSchema: { type: 'object', properties: { count: { type: 'number' } } } },
+        ],
+      }
+    } else if (method === 'resources/read' && msg.params && msg.params.uri === 'mcpforunity://instances') {
       result = {
         contents: [{ type: 'text', text: JSON.stringify({ success: true, transport: 'http', instance_count: instances.length, instances }) }],
       }
@@ -107,15 +122,18 @@ check('S2 在线', pool.serviceById('S2').alive === true)
 check('S2 发现 1 实例', pool.serviceById('S2').instances.length === 1)
 
 // ---------- 会话锁定目标实例 ----------
-const bX = pool.bind('sess-X') // 自动分配 → ProjA@aaaa1111 (S1 第一个，无占用)
+const bX = await pool.bind('sess-X') // 自动分配 → ProjA@aaaa1111 (S1 第一个，无占用)
 check('sess-X 自动分配 → ProjA', bX.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX))
-const bY = pool.bind('sess-Y') // 自动分配 → ProjB@bbbb2222 (ProjA 被占)
+check('sess-X 首次绑定返回工具列表', Array.isArray(bX.tools) && bX.toolsCount === 3 && bX.tools.some(t => t.name === 'manage_scene' && typeof t.inputSchema === 'object'), JSON.stringify(bX.tools).slice(0, 200))
+const bY = await pool.bind('sess-Y') // 自动分配 → ProjB@bbbb2222 (ProjA 被占)
 check('sess-Y 自动分配 → ProjB', bY.instanceId === 'ProjB@bbbb2222', JSON.stringify(bY))
-const bZ = pool.bind('sess-Z') // 自动分配 → ProjC@cccc3333 (S2)
+check('sess-Y 首次绑定返回工具列表', Array.isArray(bY.tools) && bY.toolsCount === 3, JSON.stringify(bY.tools).slice(0, 200))
+const bZ = await pool.bind('sess-Z') // 自动分配 → ProjC@cccc3333 (S2)
 check('sess-Z 自动分配 → ProjC', bZ.instanceId === 'ProjC@cccc3333', JSON.stringify(bZ))
+check('sess-Z 首次绑定返回工具列表（S2 服务）', Array.isArray(bZ.tools) && bZ.toolsCount === 3, JSON.stringify(bZ.tools).slice(0, 200))
 
 let conflict = null
-try { pool.bind('sess-W', { instance: 'ProjA@aaaa1111' }) } catch (e) { conflict = e.message }
+try { await pool.bind('sess-W', { instance: 'ProjA@aaaa1111' }) } catch (e) { conflict = e.message }
 check('排他：sess-W 锁 ProjA 被拒', /锁定/.test(conflict || ''), conflict)
 
 const vX = pool.view('sess-X')
@@ -177,6 +195,14 @@ check('持久化：重启后 sess-X→ProjA、sess-Y→ProjB、sess-Z→ProjC',
   pool2.bindingOf('sess-Y')?.instanceId === 'ProjB@bbbb2222' &&
   pool2.bindingOf('sess-Z')?.instanceId === 'ProjC@cccc3333')
 
+// 再次绑定（已有绑定）不重复拉取工具列表（force 绕过排他，验证仅首次拉取）
+const bX2 = await pool.bind('sess-X', { instance: 'ProjB@bbbb2222', force: true })
+check('sess-X 重复绑定（换实例）不返回工具列表', bX2.instanceId === 'ProjB@bbbb2222' && bX2.tools === undefined, JSON.stringify(bX2).slice(0, 200))
+// 解绑后重新绑定 = 该会话的又一次首次绑定 → 重新拉取工具列表
+await pool.unbind('sess-X')
+const bX3 = await pool.bind('sess-X', { instance: 'ProjA@aaaa1111', force: true })
+check('解绑后重新绑定再次返回工具列表', Array.isArray(bX3.tools) && bX3.toolsCount === 3 && bX3.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX3.tools).slice(0, 200))
+
 // ---------- apply() 装配 ----------
 const routes = []
 const registered = []
@@ -199,6 +225,7 @@ await registered.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { 
 const bindTool = registered.find(t => t.name === 'unity_pool_bind')
 const bindRes = await bindTool.execute({ instance: 'ProjB@bbbb2222' }, { agent: { id: 'sess-T' } })
 check('工具 unity_pool_bind 锁定 ProjB', bindRes.instanceId === 'ProjB@bbbb2222')
+check('工具 unity_pool_bind 首次绑定附带工具列表', Array.isArray(bindRes.tools) && bindRes.toolsCount === 3 && bindRes.tools[0].name === 'manage_scene', JSON.stringify(bindRes.tools).slice(0, 200))
 
 const mcpTool = registered.find(t => t.name === 'unity_mcp')
 const mcpRes = await mcpTool.execute({ tool: 'manage_camera', params: { action: 'screenshot' } }, { agent: { id: 'sess-T' } })
@@ -233,8 +260,23 @@ function fakeReq(method, url, body) {
   check('HTTP 非回环被拒(403)', res._out.status === 403)
 }
 
-s1.close(); s2.close(); s3.close()
+// ---------- tools/list 失败不阻断绑定 ----------
+const s4 = makeMcpServer([{ id: 'ProjE@eeee5555', name: 'ProjE', hash: 'eeee5555' }], { failToolsList: true })
+await s4.listen()
+const pool4 = createPool(ctx, {
+  services: [{ id: 'S4', name: '服务4', url: 'http://127.0.0.1:' + s4.port() + '/mcp' }],
+  dataFile: dataFile + '.s4',
+  probeIntervalMs: 5000,
+})
+await pool4.probe()
+const b4 = await pool4.bind('sess-E')
+check('tools/list 失败时绑定仍成功', b4.instanceId === 'ProjE@eeee5555', JSON.stringify(b4))
+check('tools/list 失败附带 toolsError', Array.isArray(b4.tools) && b4.toolsCount === 0 && /tools\/list boom/.test(b4.toolsError || ''), JSON.stringify(b4.toolsError))
+pool4.stop()
+
+s1.close(); s2.close(); s3.close(); s4.close()
 fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
 fsp.rm(dataFile + '.apply', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.s4', { force: true }).catch(() => {})
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILURES: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
