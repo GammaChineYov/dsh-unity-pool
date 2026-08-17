@@ -255,6 +255,11 @@ check('sess-X 重复绑定（换实例）不返回工具列表', bX2.instanceId 
 await pool.unbind('sess-X')
 const bX3 = await pool.bind('sess-X', { instance: 'ProjA@aaaa1111', force: true })
 check('解绑后重新绑定再次返回工具列表', Array.isArray(bX3.tools) && bX3.toolsCount >= 3 && bX3.tools.some(t => t.name === 'manage_scene') && bX3.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX3.tools).slice(0, 200))
+// 跨服务切换（S1 → S2）：工具集可能不同 → 重新拉取工具列表
+const s2ListCallsBefore = s2.listCalls()
+const bX4 = await pool.bind('sess-X', { instance: 'ProjC@cccc3333', force: true })
+check('跨服务重绑定返回工具列表', Array.isArray(bX4.tools) && bX4.toolsCount >= 3 && bX4.serviceId === 'S2' && bX4.tools.some(t => t.name === 'manage_scene'), JSON.stringify(bX4).slice(0, 200))
+check('跨服务重绑定触发 S2 重拉（listCalls +1）', s2.listCalls() === s2ListCallsBefore + 1, 's2 listCalls=' + s2.listCalls())
 
 // ---------- apply() 装配 ----------
 const routes = []
