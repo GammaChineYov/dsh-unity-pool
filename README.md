@@ -81,13 +81,15 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     busyWaitEnabled: true     # unity_mcp 调用前探测 Unity 忙状态（编译/刷新/进度条）并自动等待
     busyMaxWaitMs: 10000      # 忙时等待总时长上限（ms），默认 10 秒
     busyWaitIntervalMs: 500   # 忙时等待的探测间隔（ms）
+    autoUnbindOnArchive: true # 实例被归档（从池中消失/服务离线）时自动解绑绑定该实例的会话
+    unbindOfflineStreak: 2    # 服务离线连续探测次数达到该值才视为归档并自动解绑（防瞬时抖动）
 ```
 
 ## Agent 工具
 
 | 工具 | 作用 |
 |------|------|
-| `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活）+ 本会话锁定 |
+| `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活 + instancesValid/offlineStreak）+ 本会话锁定 + 最近归档自动解绑 lastAutoUnbind |
 | `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务 |
 | `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**首次绑定或跨服务切换时返回该服务 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**，拉取失败附 `toolsError` 不阻断绑定；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
 | `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃） |
@@ -106,7 +108,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 54 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 76 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
@@ -119,3 +121,4 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 54 项：mo
 - `0.3.3` **跨服务切换重拉工具列表 + 描述同步**：`unity_pool_bind` 在会话切换到另一服务（serviceId 变化）时同样重拉 `tools/list` 随结果返回（不同 mcp-for-unity server 工具集可能不同）；工具描述、系统提示指南、README（工作流/工具表/HTTP API）同步说明首次绑定/跨服务返回 tools、动态重拉、图片占位。
 - `0.3.4` **服务级并集说明**：工具列表为服务级并集（同服务多工程实例的自定义工具合并列出）——工具描述、系统提示指南、README 补充说明，避免把其他工程实例的自定义工具误当作当前实例可用（导包迁移任务双工程同服务场景实测）。
 - `0.3.7` **忙时等待 + 失败附状态**：① `unity_mcp` 转发前用 `execute_code` 探测 Unity 编辑器忙状态（isCompiling/isUpdating/Progress），忙则按 `busyWaitIntervalMs` 间隔重试，总时长不超过 `busyMaxWaitMs`（默认 10s）；探测失败视为"可能忙"（域重载窗口 execute_code 可能不可用）保守等待后继续；② 调用最终失败（isError）时把最近一次探测状态附到返回 `editorState`；关闭 `busyWaitEnabled` 可跳过忙时等待（仅失败时补一次探测附状态）。真实服务联调验证通过（失败返回带 `editorState: isCompiling=0,isUpdating=0,progressCount=0`）。
+- `0.3.8` **归档自动解绑**：每次探活（probe）完成后检查会话绑定——绑定实例不在最新发现列表（`instance-archived`）、服务连续离线达阈值（`service-offline`，`unbindOfflineStreak` 默认 2 防瞬时抖动）、服务配置不存在（`service-removed`）时自动解绑该会话（删除绑定 + 关闭 MCP 会话 + 持久化），避免会话停留在已归档实例上；实例发现失败（`instancesValid=false`）保留上次列表不清空、不据此判归档（发现失败≠实例消失）；新增配置 `autoUnbindOnArchive`（默认 true）/ `unbindOfflineStreak`（默认 2），view 暴露 `instancesValid`/`offlineStreak`/`lastAutoUnbind`，HTTP /api/config 同步返回；测试扩到 76 项。

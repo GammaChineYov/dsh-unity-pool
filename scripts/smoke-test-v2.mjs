@@ -34,11 +34,24 @@ function makeMcpServer(instances, opts = {}) {
   ]
   let listCalls = 0
   let nextSession = 1
+  let offlineFlag = false      // setOffline(true)：模拟服务离线（所有请求 503）
+  let failInstancesFlag = false // setFailInstances(true)：模拟实例发现失败（resources/read 报错）
   const server = http.createServer(async (req, res) => {
+    if (offlineFlag) {
+      // 模拟服务离线 = 连接拒绝（fetch 对 HTTP 状态码不抛错，只有网络错误才抛）；
+      // 必须放在读 body 之前——probe 探活是 GET 请求，JSON.parse('') 会先走 400 分支
+      req.socket.destroy()
+      return
+    }
     let body = ''
     for await (const c of req) body += c
     let msg
-    try { msg = JSON.parse(body) } catch { res.writeHead(400); res.end('{}'); return }
+    try { msg = JSON.parse(body) } catch {
+      // GET 探活（无 body）：返回空 JSON，fetch 视为服务在线
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{}')
+      return
+    }
     const sid = req.headers['mcp-session-id'] || null
     const method = msg.method
     if (method === 'initialize') {
@@ -65,6 +78,11 @@ function makeMcpServer(instances, opts = {}) {
       listCalls++
       result = { tools: JSON.parse(JSON.stringify(tools)) }
     } else if (method === 'resources/read' && msg.params && msg.params.uri === 'mcpforunity://instances') {
+      if (failInstancesFlag) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'instances boom' } }))
+        return
+      }
       result = {
         contents: [{ type: 'text', text: JSON.stringify({ success: true, transport: 'http', instance_count: instances.length, instances }) }],
       }
@@ -116,6 +134,8 @@ function makeMcpServer(instances, opts = {}) {
   return {
     server, sessions, calls, probes, tools, listCalls: () => listCalls, probeCount: () => probes.length,
     addTool(name) { if (!tools.some(t => t.name === name)) tools.push({ name, description: 'dynamic tool', inputSchema: { type: 'object', properties: {} } }) },
+    setOffline(v) { offlineFlag = v },
+    setFailInstances(v) { failInstancesFlag = v },
     listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close(),
   }
 }
@@ -423,6 +443,127 @@ check('探测失败保守等待：总耗时 ≥ 1×interval', elapsed9 >= 30, 'e
 pool6.stop(); pool7.stop(); pool8.stop(); pool9.stop()
 s6.close(); s7.close(); s8.close(); s9.close()
 
+// ---------- v0.3.8 归档自动解绑 ----------
+// 场景1：实例从池中消失（Unity 关闭/下线）→ probe 后自动解绑该实例的会话
+const instA = [
+  { id: 'ProjK@kkkk1111', name: 'ProjK', hash: 'kkkk1111' },
+  { id: 'ProjL@llll2222', name: 'ProjL', hash: 'llll2222' },
+]
+const sA = makeMcpServer(instA)
+await sA.listen()
+const poolA = createPool(ctx, {
+  services: [{ id: 'SA', name: '服务A', url: 'http://127.0.0.1:' + sA.port() + '/mcp' }],
+  dataFile: dataFile + '.sA',
+  probeIntervalMs: 5000,
+  unbindOfflineStreak: 2,
+})
+await poolA.probe()
+await poolA.bind('sess-K', { instance: 'ProjK@kkkk1111' })
+await poolA.bind('sess-L', { instance: 'ProjL@llll2222' })
+check('归档前：sess-K 绑定 ProjK', poolA.bindingOf('sess-K')?.instanceId === 'ProjK@kkkk1111')
+check('归档前：sess-L 绑定 ProjL', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
+instA.splice(0, 1) // ProjK 消失（Unity 关闭）
+await poolA.probe()
+check('实例归档后：sess-K 被自动解绑', poolA.bindingOf('sess-K') === null, JSON.stringify(poolA.bindingOf('sess-K')))
+check('实例归档后：sess-L 保持绑定', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
+check('实例归档后：lastAutoUnbind 记录 instance-archived', poolA.lastAutoUnbind && poolA.lastAutoUnbind.items.some(i => i.sessionId === 'sess-K' && i.reason === 'instance-archived'), JSON.stringify(poolA.lastAutoUnbind))
+const viewK = poolA.view('sess-K')
+check('view：解绑后 binding 为 null', viewK.binding === null)
+check('view：SA instancesValid=true 且仅剩 ProjL', viewK.services[0].instancesValid === true && viewK.services[0].instances.length === 1 && viewK.services[0].instances[0].id === 'ProjL@llll2222')
+check('view：rules 含 autoUnbindOnArchive/unbindOfflineStreak', viewK.rules.autoUnbindOnArchive === true && viewK.rules.unbindOfflineStreak === 2)
+check('HTTP /api/config 返回 autoUnbindOnArchive', typeof poolA.cfg.autoUnbindOnArchive === 'boolean' && poolA.cfg.unbindOfflineStreak === 2)
+
+// 场景2：实例发现失败（instancesValid=false）→ 保留旧列表、不解绑（发现失败≠实例消失）
+sA.setFailInstances(true)
+await poolA.probe()
+check('发现失败：instancesValid=false', poolA.serviceById('SA').instancesValid === false)
+check('发现失败：保留上次列表（ProjL 仍在）', poolA.serviceById('SA').instances.some(i => i.id === 'ProjL@llll2222'))
+check('发现失败：不解绑 sess-L', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
+sA.setFailInstances(false)
+
+// 场景3：服务离线——连续离线达到 unbindOfflineStreak(2) 才解绑（防瞬时抖动）
+sA.setOffline(true)
+await poolA.probe() // 第 1 次离线：streak=1，未达阈值
+check('服务离线 1 次：不解绑（防抖动）', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222', JSON.stringify(poolA.bindingOf('sess-L')))
+check('服务离线 1 次：offlineStreak=1', poolA.serviceById('SA').offlineStreak === 1)
+await poolA.probe() // 第 2 次离线：streak=2，达阈值 → 解绑
+check('服务离线 2 次：sess-L 被自动解绑', poolA.bindingOf('sess-L') === null)
+check('服务离线 2 次：lastAutoUnbind 记录 service-offline', poolA.lastAutoUnbind && poolA.lastAutoUnbind.items.some(i => i.sessionId === 'sess-L' && i.reason === 'service-offline'), JSON.stringify(poolA.lastAutoUnbind))
+sA.setOffline(false)
+poolA.stop()
+
+// 场景4：autoUnbindOnArchive=false → 不解绑
+const instB = [{ id: 'ProjM@mmmm3333', name: 'ProjM', hash: 'mmmm3333' }]
+const sB = makeMcpServer(instB)
+await sB.listen()
+const poolB = createPool(ctx, {
+  services: [{ id: 'SB', name: '服务B', url: 'http://127.0.0.1:' + sB.port() + '/mcp' }],
+  dataFile: dataFile + '.sB',
+  probeIntervalMs: 5000,
+  autoUnbindOnArchive: false,
+  unbindOfflineStreak: 1,
+})
+await poolB.probe()
+await poolB.bind('sess-M', { instance: 'ProjM@mmmm3333' })
+instB.splice(0, 1) // 实例消失
+await poolB.probe()
+check('autoUnbindOnArchive=false：实例消失不解绑', poolB.bindingOf('sess-M')?.instanceId === 'ProjM@mmmm3333', JSON.stringify(poolB.bindingOf('sess-M')))
+check('autoUnbindOnArchive=false：view.rules 反映 false', poolB.view('sess-M').rules.autoUnbindOnArchive === false)
+poolB.stop()
+sB.close()
+
+// 场景5：服务从未在线过（aliveAt=0）→ 服务离线不因启动抖动解绑
+const instC = [{ id: 'ProjN@nnnn4444', name: 'ProjN', hash: 'nnnn4444' }]
+const sC = makeMcpServer(instC)
+await sC.listen()
+const poolC = createPool(ctx, {
+  services: [{ id: 'SC', name: '服务C', url: 'http://127.0.0.1:' + sC.port() + '/mcp' }],
+  dataFile: dataFile + '.sC',
+  probeIntervalMs: 5000,
+  unbindOfflineStreak: 1,
+})
+await poolC.probe()
+await poolC.bind('sess-N', { instance: 'ProjN@nnnn4444' })
+// 直接离线（从未离线过 → aliveAt>0，但本次是第一次离线 streak=1 达阈值）
+// 先造一次"从未在线"：手动把 aliveAt 归零模拟
+poolC.serviceById('SC').aliveAt = 0
+sC.setOffline(true)
+await poolC.probe()
+check('服务从未在线过且离线：不解绑（避免启动抖动误伤）', poolC.bindingOf('sess-N')?.instanceId === 'ProjN@nnnn4444', JSON.stringify(poolC.bindingOf('sess-N')))
+sC.setOffline(false)
+poolC.stop()
+sC.close()
+
+// 场景6：service-removed（服务配置不存在）→ 自动解绑
+const instD = [{ id: 'ProjO@oooo5555', name: 'ProjO', hash: 'oooo5555' }]
+const sD = makeMcpServer(instD)
+await sD.listen()
+const poolD = createPool(ctx, {
+  services: [{ id: 'SD', name: '服务D', url: 'http://127.0.0.1:' + sD.port() + '/mcp' }],
+  dataFile: dataFile + '.sD',
+  probeIntervalMs: 5000,
+  unbindOfflineStreak: 1,
+})
+await poolD.probe()
+await poolD.bind('sess-O', { instance: 'ProjO@oooo5555' })
+poolD.services = poolD.services.filter(s => s.id !== 'SD') // 配置移除
+await poolD.probe()
+check('service-removed：绑定被自动解绑', poolD.bindingOf('sess-O') === null)
+check('service-removed：lastAutoUnbind 记录', poolD.lastAutoUnbind && poolD.lastAutoUnbind.items.some(i => i.sessionId === 'sess-O' && i.reason === 'service-removed'), JSON.stringify(poolD.lastAutoUnbind))
+poolD.stop()
+sD.close()
+
+// 场景7：自动解绑持久化——重建池后不残留已归档绑定
+const poolA2 = createPool(ctx, {
+  services: [{ id: 'SA', name: '服务A', url: 'http://127.0.0.1:' + sA.port() + '/mcp' }],
+  dataFile: dataFile + '.sA',
+  probeIntervalMs: 5000,
+})
+await poolA2.probe()
+check('持久化：重建后 sess-K/sess-L 均未残留', poolA2.bindingOf('sess-K') === null && poolA2.bindingOf('sess-L') === null)
+poolA2.stop()
+sA.close()
+
 s1.close(); s2.close(); s3.close(); s4.close(); s5.close()
 fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
 fsp.rm(dataFile + '.apply', { force: true }).catch(() => {})
@@ -432,5 +573,9 @@ fsp.rm(dataFile + '.s6', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.s7', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.s8', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.s9', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.sA', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.sB', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.sC', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.sD', { force: true }).catch(() => {})
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILURES: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
