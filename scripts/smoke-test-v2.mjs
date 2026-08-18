@@ -20,9 +20,14 @@ function check(name, cond, detail) {
 function makeMcpServer(instances, opts = {}) {
   // instances: [{id, name, hash}]; opts.failToolsList: true 时 tools/list 报错
   // opts.toolDefs: 初始工具定义数组（可随后 addTool 动态增删）
+  // opts.busyPattern: execute_code 探测模式数组（每调用消费一个；true=忙, false=空闲, 'error'=探测返回 isError；耗尽后默认空闲）
+  // opts.failTool: 指定工具名在 tools/call 时返回 isError
   const sessions = new Map() // sessionId -> { active: string|null }
-  const calls = []           // {sessionId, active, tool, args}
+  const calls = []           // {sessionId, active, tool, args}（execute_code 探测不在此列）
+  const probes = []          // execute_code 探测调用记录
+  const busyPattern = Array.isArray(opts.busyPattern) ? [...opts.busyPattern] : []
   const tools = opts.toolDefs ? JSON.parse(JSON.stringify(opts.toolDefs)) : [
+    { name: 'execute_code', description: '执行任意 C#（忙状态探测）', inputSchema: { type: 'object', properties: { action: { type: 'string' }, code: { type: 'string' } } } },
     { name: 'manage_scene', description: '场景操作（get_hierarchy 等）', inputSchema: { type: 'object', properties: { action: { type: 'string' } } } },
     { name: 'manage_gameobject', description: 'GameObject 操作', inputSchema: { type: 'object', properties: { action: { type: 'string' }, name: { type: 'string' } } } },
     { name: 'read_console', description: '读控制台', inputSchema: { type: 'object', properties: { count: { type: 'number' } } } },
@@ -75,10 +80,21 @@ function makeMcpServer(instances, opts = {}) {
           st.active = found.id
           result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Active instance set to ' + found.id, data: { instance: found.id, session_id: sid } }) }] }
         }
+      } else if (name === 'execute_code') {
+        // 忙状态探测：按 busyPattern 消费（true=忙, false=空闲, 'error'=探测报错），耗尽后默认空闲
+        probes.push({ sessionId: sid, active: st.active })
+        const b = busyPattern.length > 0 ? busyPattern.shift() : false
+        if (b === 'error') {
+          result = { isError: true, content: [{ type: 'text', text: 'execute_code boom' }] }
+        } else {
+          result = { content: [{ type: 'text', text: b ? 'c=1;u=1;p=2' : 'c=0;u=0;p=0' }] }
+        }
       } else {
         calls.push({ sessionId: sid, active: st.active, tool: name, args })
         if (!st.active) {
           result = { isError: true, content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'no active instance; available: ' + instances.map(i => i.id).join(',') }) }] }
+        } else if (opts.failTool && name === opts.failTool) {
+          result = { isError: true, content: [{ type: 'text', text: 'tool boom: ' + name }] }
         } else if (name === 'manage_camera' && args.action === 'screenshot') {
           // 模拟官方 manage_camera include_image=true 的 ImageContent 块
           result = {
@@ -98,7 +114,7 @@ function makeMcpServer(instances, opts = {}) {
     res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }))
   })
   return {
-    server, sessions, calls, tools, listCalls: () => listCalls,
+    server, sessions, calls, probes, tools, listCalls: () => listCalls, probeCount: () => probes.length,
     addTool(name) { if (!tools.some(t => t.name === name)) tools.push({ name, description: 'dynamic tool', inputSchema: { type: 'object', properties: {} } }) },
     listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close(),
   }
@@ -138,13 +154,13 @@ check('S2 发现 1 实例', pool.serviceById('S2').instances.length === 1)
 // ---------- 会话锁定目标实例 ----------
 const bX = await pool.bind('sess-X') // 自动分配 → ProjA@aaaa1111 (S1 第一个，无占用)
 check('sess-X 自动分配 → ProjA', bX.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX))
-check('sess-X 首次绑定返回工具列表', Array.isArray(bX.tools) && bX.toolsCount === 3 && bX.tools.some(t => t.name === 'manage_scene' && typeof t.inputSchema === 'object'), JSON.stringify(bX.tools).slice(0, 200))
+check('sess-X 首次绑定返回工具列表', Array.isArray(bX.tools) && bX.toolsCount === 4 && bX.tools.some(t => t.name === 'manage_scene' && typeof t.inputSchema === 'object'), JSON.stringify(bX.tools).slice(0, 200))
 const bY = await pool.bind('sess-Y') // 自动分配 → ProjB@bbbb2222 (ProjA 被占)
 check('sess-Y 自动分配 → ProjB', bY.instanceId === 'ProjB@bbbb2222', JSON.stringify(bY))
-check('sess-Y 首次绑定返回工具列表', Array.isArray(bY.tools) && bY.toolsCount === 3, JSON.stringify(bY.tools).slice(0, 200))
+check('sess-Y 首次绑定返回工具列表', Array.isArray(bY.tools) && bY.toolsCount === 4, JSON.stringify(bY.tools).slice(0, 200))
 const bZ = await pool.bind('sess-Z') // 自动分配 → ProjC@cccc3333 (S2)
 check('sess-Z 自动分配 → ProjC', bZ.instanceId === 'ProjC@cccc3333', JSON.stringify(bZ))
-check('sess-Z 首次绑定返回工具列表（S2 服务）', Array.isArray(bZ.tools) && bZ.toolsCount === 3, JSON.stringify(bZ.tools).slice(0, 200))
+check('sess-Z 首次绑定返回工具列表（S2 服务）', Array.isArray(bZ.tools) && bZ.toolsCount === 4, JSON.stringify(bZ.tools).slice(0, 200))
 
 let conflict = null
 try { await pool.bind('sess-W', { instance: 'ProjA@aaaa1111' }) } catch (e) { conflict = e.message }
@@ -332,10 +348,89 @@ check('tools/list 失败时绑定仍成功', b4.instanceId === 'ProjE@eeee5555',
 check('tools/list 失败附带 toolsError', Array.isArray(b4.tools) && b4.toolsCount === 0 && /tools\/list boom/.test(b4.toolsError || ''), JSON.stringify(b4.toolsError))
 pool4.stop()
 
+// ---------- v0.3.7 忙时等待 + 失败附状态 ----------
+// 忙时等待：2 次忙探测 + 1 次空闲 → 等待后调用成功
+const s6 = makeMcpServer([{ id: 'ProjG@gggg7777', name: 'ProjG', hash: 'gggg7777' }], { busyPattern: [true, true, false] })
+await s6.listen()
+const pool6 = createPool(ctx, {
+  services: [{ id: 'S6', name: '服务6', url: 'http://127.0.0.1:' + s6.port() + '/mcp' }],
+  dataFile: dataFile + '.s6',
+  probeIntervalMs: 5000,
+  busyWaitEnabled: true,
+  busyMaxWaitMs: 2000,
+  busyWaitIntervalMs: 50,
+})
+await pool6.probe()
+await pool6.bind('sess-G')
+const t0 = Date.now()
+const r6 = await pool6.proxyMcp('sess-G', 'manage_scene', { action: 'get_hierarchy' })
+const elapsed6 = Date.now() - t0
+check('忙时等待：探测 3 次（2 忙 + 1 空闲）', s6.probeCount() === 3, 'probes=' + s6.probeCount())
+check('忙时等待：等待后调用成功', r6.success === true && r6.tool === 'manage_scene', JSON.stringify(r6).slice(0, 200))
+check('忙时等待：总耗时 ≥ 2×interval（约 100ms）', elapsed6 >= 60, 'elapsed=' + elapsed6)
+check('忙时等待：calls 里 execute_code 不计入业务调用', s6.calls.every(c => c.tool !== 'execute_code') && s6.calls.length === 1, 'calls=' + s6.calls.length)
+
+// 失败附状态：目标工具失败（isError）→ 返回附带 editorState
+const s7 = makeMcpServer([{ id: 'ProjH@hhhh8888', name: 'ProjH', hash: 'hhhh8888' }], { failTool: 'manage_scene' })
+await s7.listen()
+const pool7 = createPool(ctx, {
+  services: [{ id: 'S7', name: '服务7', url: 'http://127.0.0.1:' + s7.port() + '/mcp' }],
+  dataFile: dataFile + '.s7',
+  probeIntervalMs: 5000,
+  busyWaitIntervalMs: 20,
+})
+await pool7.probe()
+await pool7.bind('sess-H')
+const r7 = await pool7.proxyMcp('sess-H', 'manage_scene', { action: 'get_hierarchy' })
+check('失败附状态：isError 且带 editorState', r7.isError === true && /^isCompiling=0,isUpdating=0,progressCount=0$/.test(r7.editorState || ''), JSON.stringify(r7).slice(0, 300))
+
+// 关闭忙时等待：不探测直接调用；失败时补一次探测附状态
+const s8 = makeMcpServer([{ id: 'ProjI@iiii9999', name: 'ProjI', hash: 'iiii9999' }], { failTool: 'manage_scene' })
+await s8.listen()
+const pool8 = createPool(ctx, {
+  services: [{ id: 'S8', name: '服务8', url: 'http://127.0.0.1:' + s8.port() + '/mcp' }],
+  dataFile: dataFile + '.s8',
+  probeIntervalMs: 5000,
+  busyWaitEnabled: false,
+})
+await pool8.probe()
+await pool8.bind('sess-I')
+const r8ok = await pool8.proxyMcp('sess-I', 'manage_gameobject', { action: 'create', name: 'Cube' })
+check('关闭忙时等待：成功调用不探测', r8ok.success === true && s8.probeCount() === 0, 'probes=' + s8.probeCount())
+const r8 = await pool8.proxyMcp('sess-I', 'manage_scene', { action: 'get_hierarchy' })
+check('关闭忙时等待：失败后补探测附状态', s8.probeCount() === 1 && r8.isError === true && /^isCompiling=0,isUpdating=0,progressCount=0$/.test(r8.editorState || ''), JSON.stringify(r8).slice(0, 300))
+
+// 探测失败保守等待：探测返回 isError → 视为可能忙等待后继续；第二次探测空闲 → 调用成功
+const s9 = makeMcpServer([{ id: 'ProjJ@jjjj0000', name: 'ProjJ', hash: 'jjjj0000' }], { busyPattern: ['error', false] })
+await s9.listen()
+const pool9 = createPool(ctx, {
+  services: [{ id: 'S9', name: '服务9', url: 'http://127.0.0.1:' + s9.port() + '/mcp' }],
+  dataFile: dataFile + '.s9',
+  probeIntervalMs: 5000,
+  busyWaitEnabled: true,
+  busyMaxWaitMs: 2000,
+  busyWaitIntervalMs: 50,
+})
+await pool9.probe()
+await pool9.bind('sess-J')
+const t9 = Date.now()
+const r9 = await pool9.proxyMcp('sess-J', 'manage_scene', { action: 'get_hierarchy' })
+const elapsed9 = Date.now() - t9
+check('探测失败保守等待：探测 2 次（1 错 + 1 空闲）', s9.probeCount() === 2, 'probes=' + s9.probeCount())
+check('探测失败保守等待：等待后调用成功', r9.success === true, JSON.stringify(r9).slice(0, 200))
+check('探测失败保守等待：总耗时 ≥ 1×interval', elapsed9 >= 30, 'elapsed=' + elapsed9)
+
+pool6.stop(); pool7.stop(); pool8.stop(); pool9.stop()
+s6.close(); s7.close(); s8.close(); s9.close()
+
 s1.close(); s2.close(); s3.close(); s4.close(); s5.close()
 fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
 fsp.rm(dataFile + '.apply', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.s4', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.s5', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.s6', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.s7', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.s8', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.s9', { force: true }).catch(() => {})
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILURES: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
