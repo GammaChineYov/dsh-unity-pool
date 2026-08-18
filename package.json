@@ -1,6 +1,6 @@
 {
   "name": "dsh-unity-pool",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "DSH plugin: per-session Unity service-pool connection management — each session binds one Unity service (instance <-> service <-> active state visible).",
   "type": "module",
   "main": "lib/index.js",
