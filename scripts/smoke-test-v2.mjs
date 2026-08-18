@@ -136,6 +136,7 @@ function makeMcpServer(instances, opts = {}) {
     addTool(name) { if (!tools.some(t => t.name === name)) tools.push({ name, description: 'dynamic tool', inputSchema: { type: 'object', properties: {} } }) },
     setOffline(v) { offlineFlag = v },
     setFailInstances(v) { failInstancesFlag = v },
+    instancesRef: instances,
     listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close(),
   }
 }
@@ -301,12 +302,13 @@ check('跨服务重绑定触发 S2 重拉（listCalls +1）', s2.listCalls() ===
 const routes = []
 const registered = []
 const sections = []
+const promptContexts = []
 const fakeCtx = {
   logger: { info() {}, warn() {}, error() {} },
   effect(fn) { fn(); return () => {} },
   inject(services, fn) { fn({ effect: fakeCtx.effect, webServer: fakeCtx.webServer }) },
   tools: { register(def) { registered.push(def) } },
-  systemPrompt: { section(s) { sections.push(s) } },
+  systemPrompt: { section(s) { sections.push(s) }, context(c) { promptContexts.push(c) } },
   webServer: { register(route) { routes.push(route); return () => {} } },
 }
 apply(fakeCtx, { services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }], dataFile: dataFile + '.apply', probeIntervalMs: 5000 })
@@ -353,6 +355,32 @@ function fakeReq(method, url, body) {
   await handler({ method: 'GET', url: '/unity-pool/api/status', headers: { host: 'evil.example.com' }, on() {} }, res)
   check('HTTP 非回环被拒(403)', res._out.status === 403)
 }
+
+// ---------- v0.3.9 归档解绑动态通知（systemPrompt.context） ----------
+const archiveCtx = promptContexts.find(c => c.name === 'unity-pool:archive')
+check('apply：注册归档通知 context（text 为函数）', Boolean(archiveCtx) && typeof archiveCtx.text === 'function')
+check('通知 context：无归档记录时注入空串', archiveCtx.text({ agent: { id: 'sess-T', session: { id: 'sess-T' } } }) === '')
+{
+  const res2 = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/config'), res2)
+  const pb2 = JSON.parse(res2._out.body)
+  check('HTTP /api/config 返回 notifyUnbindOnArchive', pb2.ok === true && pb2.value.notifyUnbindOnArchive === true)
+}
+// 用 apply 池触发真实归档：sess-T 已绑定 ProjB（S1 → s1）；移除 ProjB 后 scan（内部 probe）→ 自动解绑
+const idxProjB = s1.instancesRef.findIndex(i => i.id === 'ProjB@bbbb2222')
+if (idxProjB >= 0) s1.instancesRef.splice(idxProjB, 1)
+await registered.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { id: 'sess-T' } })
+{
+  const res3 = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/status?sessionId=sess-T'), res3)
+  const pb3 = JSON.parse(res3._out.body)
+  check('归档后（apply 池）：sess-T 已自动解绑', pb3.ok === true && pb3.value.binding === null, JSON.stringify(pb3.value.binding))
+}
+const notifT = archiveCtx.text({ agent: { id: 'sess-T', session: { id: 'sess-T' } } })
+check('通知 context：归档后向被解绑会话注入中文通知', notifT.includes('【Unity 服务池】') && notifT.includes('ProjB@bbbb2222') && notifT.includes('unity_pool_bind'), notifT.slice(0, 220))
+check('通知 context：其他会话注入空串', archiveCtx.text({ agent: { id: 'other-session', session: { id: 'other-session' } } }) === '')
+// 恢复 s1 实例数组（保持后续独立测试互不影响）
+if (idxProjB >= 0 && !s1.instancesRef.some(i => i.id === 'ProjB@bbbb2222')) s1.instancesRef.push({ id: 'ProjB@bbbb2222', name: 'ProjB', hash: 'bbbb2222' })
 
 // ---------- tools/list 失败不阻断绑定 ----------
 const s4 = makeMcpServer([{ id: 'ProjE@eeee5555', name: 'ProjE', hash: 'eeee5555' }], { failToolsList: true })

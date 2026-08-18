@@ -29,6 +29,10 @@ MCP 会话（Session）＝ 每 DSH 会话 × 服务 一个独立 Mcp-Session-Id�
 5. 另一个会话锁 A 并行工作：per MCP-Session-Id 隔离，两会话各自 target 各自实例，互不干扰；
 6. 用完 `unity_pool_unbind` 释放。
 
+> 归档自动解绑 + 通知：实例被归档（Unity 关闭/下线/服务离线）时插件自动解绑该实例的会话，
+> 并在下一轮请求向被解绑会话注入一段中文通知（时间/实例/原因 + 重新 bind 指引，官方
+> `systemPrompt.context` 机制，仅该会话可见），agent 无需主动碰工具就能感知绑定已失效。
+
 > 关于「切换/排队」：官方 HTTP 模式 active 实例按 session 隔离（见 `test_multi_user_session_isolation.py`），
 > 所以不需要「服务级全局切换 + 互斥等待」。同一实例被多会话并发调用时由 Unity 侧单线程排队（官方文档所述，性能排队而非错误）。
 
@@ -83,6 +87,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     busyWaitIntervalMs: 500   # 忙时等待的探测间隔（ms）
     autoUnbindOnArchive: true # 实例被归档（从池中消失/服务离线）时自动解绑绑定该实例的会话
     unbindOfflineStreak: 2    # 服务离线连续探测次数达到该值才视为归档并自动解绑（防瞬时抖动）
+    notifyUnbindOnArchive: true # 归档自动解绑后，向被解绑的会话注入运行时通知（systemPrompt.context，下一轮 request 自动感知）
 ```
 
 ## Agent 工具
@@ -108,7 +113,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 76 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 82 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
@@ -122,3 +127,4 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 76 项：mo
 - `0.3.4` **服务级并集说明**：工具列表为服务级并集（同服务多工程实例的自定义工具合并列出）——工具描述、系统提示指南、README 补充说明，避免把其他工程实例的自定义工具误当作当前实例可用（导包迁移任务双工程同服务场景实测）。
 - `0.3.7` **忙时等待 + 失败附状态**：① `unity_mcp` 转发前用 `execute_code` 探测 Unity 编辑器忙状态（isCompiling/isUpdating/Progress），忙则按 `busyWaitIntervalMs` 间隔重试，总时长不超过 `busyMaxWaitMs`（默认 10s）；探测失败视为"可能忙"（域重载窗口 execute_code 可能不可用）保守等待后继续；② 调用最终失败（isError）时把最近一次探测状态附到返回 `editorState`；关闭 `busyWaitEnabled` 可跳过忙时等待（仅失败时补一次探测附状态）。真实服务联调验证通过（失败返回带 `editorState: isCompiling=0,isUpdating=0,progressCount=0`）。
 - `0.3.8` **归档自动解绑**：每次探活（probe）完成后检查会话绑定——绑定实例不在最新发现列表（`instance-archived`）、服务连续离线达阈值（`service-offline`，`unbindOfflineStreak` 默认 2 防瞬时抖动）、服务配置不存在（`service-removed`）时自动解绑该会话（删除绑定 + 关闭 MCP 会话 + 持久化），避免会话停留在已归档实例上；实例发现失败（`instancesValid=false`）保留上次列表不清空、不据此判归档（发现失败≠实例消失）；新增配置 `autoUnbindOnArchive`（默认 true）/ `unbindOfflineStreak`（默认 2），view 暴露 `instancesValid`/`offlineStreak`/`lastAutoUnbind`，HTTP /api/config 同步返回；测试扩到 76 项。
+- `0.3.9` **归档解绑动态通知**：注册 `systemPrompt.context('unity-pool:archive')`（text 为函数，每次 agent request 前求值——官方机制，sandbox-policy 同款）；自动解绑后只向被解绑的会话注入中文通知（时间/实例/原因 + 重新 bind 指引），其他会话注入空串，下一轮 request 自动感知，无需碰 `unity_mcp` 才撞上「未锁定」报错；新增配置 `notifyUnbindOnArchive`（默认 true），view.rules / HTTP /api/config 同步返回；测试扩到 82 项。
