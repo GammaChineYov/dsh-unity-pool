@@ -36,6 +36,10 @@ function makeMcpServer(instances, opts = {}) {
   let nextSession = 1
   let offlineFlag = false      // setOffline(true)：模拟服务离线（所有请求 503）
   let failInstancesFlag = false // setFailInstances(true)：模拟实例发现失败（resources/read 报错）
+  let failToolsListFlag = opts.failToolsList === true // setFailToolsList(v)：运行时切换 tools/list 失败
+  // 选中项返回（真实场景：场景内 GameObject 的 InstanceID 为负数——插件解析必须支持负号）
+  let selectionResult = 'count=1\n- Cube | type=GameObject | id=-101 | path=Root/Cube' // setSelectionResult(v)：切换选中项
+  let snapshotFile = null // setSnapshotFile(v)：ui_snapshot 返回 absolutePath → 走快照地图模式
   const server = http.createServer(async (req, res) => {
     if (offlineFlag) {
       // 模拟服务离线 = 连接拒绝（fetch 对 HTTP 状态码不抛错，只有网络错误才抛）；
@@ -69,7 +73,7 @@ function makeMcpServer(instances, opts = {}) {
     }
     const st = sessions.get(sid)
     let result
-    if (method === 'tools/list' && opts.failToolsList) {
+    if (method === 'tools/list' && failToolsListFlag) {
       res.writeHead(500, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'tools/list boom' } }))
       return
@@ -86,8 +90,8 @@ function makeMcpServer(instances, opts = {}) {
       result = {
         contents: [{ type: 'text', text: JSON.stringify({ success: true, transport: 'http', instance_count: instances.length, instances }) }],
       }
-    } else if (method === 'resources/read' && msg.params && /^mcpforunity:\/\/scene\/gameobject\/\d+\/components$/.test(msg.params.uri)) {
-      // 选中物体序列化字段（v0.4.0 状态携带）
+    } else if (method === 'resources/read' && msg.params && /^mcpforunity:\/\/scene\/gameobject\/-?\d+\/components$/.test(msg.params.uri)) {
+      // 选中物体序列化字段（v0.4.0 状态携带）；场景 GameObject 的 InstanceID 为负数
       result = {
         contents: [{ type: 'text', text: JSON.stringify({
           success: true, message: null, error: null,
@@ -115,9 +119,9 @@ function makeMcpServer(instances, opts = {}) {
       } else if (name === 'execute_code') {
         probes.push({ sessionId: sid, active: st.active })
         const code = String(args.code || '')
-        // v0.4.0 状态携带：Selection 读取代码 → 回显选中项；Console 选中反射代码 → 回显条目文本
+        // v0.4.0 状态携带：Selection 读取代码 → 回显选中项（id 为负数=场景 GameObject）
         if (code.includes('UnityEditor.Selection.objects')) {
-          result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: 'count=1\n- Cube | type=GameObject | id=101 | path=Root/Cube', compiler: 'roslyn' } }) }] }
+          result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: selectionResult, compiler: 'roslyn' } }) }] }
         } else if (code.includes('ConsoleWindow')) {
           result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: 'selectedRow=3\nACTIVE_TEXT:\n[传输>>] mock console selected entry (at Assets/Test.cs:10)', compiler: 'roslyn' } }) }] }
         } else {
@@ -137,8 +141,10 @@ function makeMcpServer(instances, opts = {}) {
           result = { isError: true, content: [{ type: 'text', text: 'tool boom: ' + name }] }
         } else if (name === 'ui_snapshot') {
           // v0.4.0 状态携带：ui-snapshot 快照（自定义工具，LBTools 风格返回）
+          const summary = { nodeCount: 6, refCount: 2, backrefCount: 2, rootCount: 1, cached: false, libraryPath: 'Library/LBTools/UISnapshots/mock.json', markdownPath: 'Library/LBTools/UISnapshots/mock.md' }
+          if (snapshotFile) summary.absolutePath = snapshotFile // 地图模式：指向可解析的 Library JSON
           result = {
-            content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'UI snapshot - 2 nodes, 1 refs', error: null, data: { summary: { nodeCount: 2, refCount: 1, backrefCount: 0, rootCount: 1, cached: false, libraryPath: 'Library/LBTools/UISnapshots/mock.json', markdownPath: 'Library/LBTools/UISnapshots/mock.md' }, roots: [{ instanceID: 101 }], text: '# UI Snapshot: 2 nodes, 1 refs\r\nRoots: [101]\r\nTree:\r\n- [101] Cube (Transform,BoxCollider) R:1 B:0\r\n  - [102] Child (Transform) R:0 B:1' } }) }],
+            content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'UI snapshot - 6 nodes, 2 refs', error: null, data: { summary, roots: [{ instanceID: 101 }], text: '# UI Snapshot: 6 nodes, 2 refs, 2 backrefs\r\nRoots: [101]\r\nTree:\r\n- [101] Cube (Transform,BoxCollider) R:2 B:2 (inactive) rect:[0,0,10,10]\r\n  - [102] Template (Image,ScrollRect) R:2 B:1 (inactive) rect:[0,0,0,0]\r\n    - [104] Viewport (Image,Mask) R:1 B:1 (inactive) rect:[0,0,0,0]\r\n      - [105] Content R:0 B:1 (inactive) rect:[0,0,0,0]\r\n  - [106] Template (Image,ScrollRect) R:2 B:1 (inactive) rect:[0,0,0,0]\r\n    - [107] Viewport (Image,Mask) R:1 B:1 (inactive) rect:[0,0,0,0]\r\n      - [108] Content R:0 B:1 (inactive) rect:[0,0,0,0]\r\n  - [110] label_0_0 R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [111] Icon (Image) R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [112] Text (Text) R:1 B:0 (inactive) rect:[0,0,0,0]\r\n  - [113] label_0_1 R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [114] Icon (Image) R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [115] Text (Text) R:1 B:0 (inactive) rect:[0,0,0,0]\r\nRefs (outgoing):\r\n[101] Cube.Comp.fieldA -> [103] TargetA (Material)\r\n[101] Cube.Comp.fieldB -> [109] TargetB\r\n[101] Cube.Comp.fieldC -> [111] TargetC\r\n[101] Cube.Comp.fieldC -> [111] TargetC\r\nBackrefs (incoming, 快照内):\r\n[102] <- [101] Cube.Comp.fieldA\r\n[102] <- [104] Viewport.Image.m_Sprite' } }) }],
           }
         } else if (name === 'read_console' && args.action === 'get') {
           // v0.4.0 状态携带：Console 全文
@@ -153,6 +159,9 @@ function makeMcpServer(instances, opts = {}) {
               { type: 'image', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', mimeType: 'image/png' },
             ],
           }
+        } else if (!tools.some(t => t.name === name)) {
+          // 模拟官方服务端：工具不在 tools/list 里 → Unknown tool
+          result = { isError: true, content: [{ type: 'text', text: "Unknown tool: '" + name + "'" }] }
         } else {
           result = { content: [{ type: 'text', text: JSON.stringify({ ok: true, active: st.active, tool: name, args }) }] }
         }
@@ -168,6 +177,9 @@ function makeMcpServer(instances, opts = {}) {
     addTool(name) { if (!tools.some(t => t.name === name)) tools.push({ name, description: 'dynamic tool', inputSchema: { type: 'object', properties: {} } }) },
     setOffline(v) { offlineFlag = v },
     setFailInstances(v) { failInstancesFlag = v },
+    setFailToolsList(v) { failToolsListFlag = v },
+    setSelectionResult(v) { selectionResult = v },
+    setSnapshotFile(v) { snapshotFile = v },
     instancesRef: instances,
     listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close(),
   }
@@ -317,10 +329,12 @@ check('持久化：重启后 sess-X→ProjA、sess-Y→ProjB、sess-Z→ProjC',
   pool2.bindingOf('sess-Y')?.instanceId === 'ProjB@bbbb2222' &&
   pool2.bindingOf('sess-Z')?.instanceId === 'ProjC@cccc3333')
 
-// 再次绑定（已有绑定）不重复拉取工具列表（force 绕过排他，验证仅首次拉取）
+// 再次绑定（同服务换实例）：每次绑定都返回最新工具列表（同服务也重拉，保持动态工具集合新鲜）
+const s1ListCallsRepeat = s1.listCalls()
 const bX2 = await pool.bind('sess-X', { instance: 'ProjB@bbbb2222', force: true })
-check('sess-X 重复绑定（换实例）不返回工具列表', bX2.instanceId === 'ProjB@bbbb2222' && bX2.tools === undefined, JSON.stringify(bX2).slice(0, 200))
-// 解绑后重新绑定 = 该会话的又一次首次绑定 → 重新拉取工具列表
+check('sess-X 重复绑定（换实例）仍返回工具列表', bX2.instanceId === 'ProjB@bbbb2222' && Array.isArray(bX2.tools) && bX2.toolsCount >= 4 && bX2.tools.some(t => t.name === 'manage_scene'), JSON.stringify(bX2).slice(0, 200))
+check('sess-X 重复绑定触发重拉（listCalls +1）', s1.listCalls() === s1ListCallsRepeat + 1, 'listCalls=' + s1.listCalls())
+// 解绑后重新绑定 → 又一次完整拉取工具列表
 await pool.unbind('sess-X')
 const bX3 = await pool.bind('sess-X', { instance: 'ProjA@aaaa1111', force: true })
 check('解绑后重新绑定再次返回工具列表', Array.isArray(bX3.tools) && bX3.toolsCount >= 3 && bX3.tools.some(t => t.name === 'manage_scene') && bX3.instanceId === 'ProjA@aaaa1111', JSON.stringify(bX3.tools).slice(0, 200))
@@ -329,6 +343,28 @@ const s2ListCallsBefore = s2.listCalls()
 const bX4 = await pool.bind('sess-X', { instance: 'ProjC@cccc3333', force: true })
 check('跨服务重绑定返回工具列表', Array.isArray(bX4.tools) && bX4.toolsCount >= 3 && bX4.serviceId === 'S2' && bX4.tools.some(t => t.name === 'manage_scene'), JSON.stringify(bX4).slice(0, 200))
 check('跨服务重绑定触发 S2 重拉（listCalls +1）', s2.listCalls() === s2ListCallsBefore + 1, 's2 listCalls=' + s2.listCalls())
+
+// view：已绑定会话带工具名速查（tools: {count, names}）；未绑定为 null
+const vTools = pool.view('sess-X').tools
+check('view：已绑定会话带工具名速查', vTools && vTools.serviceId === 'S2' && vTools.count >= 4 && vTools.names.includes('manage_scene'), JSON.stringify(vTools))
+check('view：未绑定会话 tools 为 null', pool.view('sess-NO').tools === null, JSON.stringify(pool.view('sess-NO').tools))
+
+// ---------- Unknown tool 错误附可用工具名列表 + 相似工具提示 ----------
+const s1u = makeMcpServer([{ id: 'ProjU@uuuu9999', name: 'ProjU', hash: 'uuuu9999' }])
+await s1u.listen()
+const poolU = createPool(ctx, {
+  services: [{ id: 'SU', name: '服务U', url: 'http://127.0.0.1:' + s1u.port() + '/mcp' }],
+  dataFile: dataFile + '.u',
+  probeIntervalMs: 5000,
+})
+await poolU.probe()
+await poolU.bind('sess-U')
+const unk = await poolU.proxyMcp('sess-U', 'read_editor_state', {})
+check('未知工具：错误附可用工具名列表', unk.success === false && /Unknown tool: 'read_editor_state'/.test(unk.text) && /可用工具（4 个）：execute_code, manage_scene, manage_gameobject, read_console/.test(unk.text), unk.text.slice(0, 300))
+check('未知工具：附编辑器状态工具指引（unity_pool_state）', /unity_pool_state/.test(unk.text), unk.text.slice(0, 300))
+const unk2 = await poolU.proxyMcp('sess-U', 'manage_scen', {})
+check('未知工具：相似工具提示命中（manage_scen → manage_scene）', unk2.success === false && /相似工具：manage_scene/.test(unk2.text), unk2.text.slice(0, 300))
+poolU.stop()
 
 // ---------- apply() 装配 ----------
 const routes = []
@@ -353,7 +389,7 @@ await registered.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { 
 const bindTool = registered.find(t => t.name === 'unity_pool_bind')
 const bindRes = await bindTool.execute({ instance: 'ProjB@bbbb2222' }, { agent: { id: 'sess-T' } })
 check('工具 unity_pool_bind 锁定 ProjB', bindRes.instanceId === 'ProjB@bbbb2222')
-check('工具 unity_pool_bind 首次绑定附带工具列表', Array.isArray(bindRes.tools) && bindRes.toolsCount >= 3 && bindRes.tools.some(t => t.name === 'manage_scene'), JSON.stringify(bindRes.tools).slice(0, 200))
+check('工具 unity_pool_bind 绑定附带工具列表', Array.isArray(bindRes.tools) && bindRes.toolsCount >= 3 && bindRes.tools.some(t => t.name === 'manage_scene'), JSON.stringify(bindRes.tools).slice(0, 200))
 
 const mcpTool = registered.find(t => t.name === 'unity_mcp')
 const mcpRes = await mcpTool.execute({ tool: 'manage_camera', params: { action: 'screenshot' } }, { agent: { id: 'sess-T' } })
@@ -427,6 +463,22 @@ const b4 = await pool4.bind('sess-E')
 check('tools/list 失败时绑定仍成功', b4.instanceId === 'ProjE@eeee5555', JSON.stringify(b4))
 check('tools/list 失败附带 toolsError', Array.isArray(b4.tools) && b4.toolsCount === 0 && /tools\/list boom/.test(b4.toolsError || ''), JSON.stringify(b4.toolsError))
 pool4.stop()
+
+// ---------- tools/list 失败回退缓存（重复绑定仍带上次成功的列表） ----------
+const s10 = makeMcpServer([{ id: 'ProjK@kkkk0001', name: 'ProjK', hash: 'kkkk0001' }])
+await s10.listen()
+const pool10 = createPool(ctx, {
+  services: [{ id: 'S10', name: '服务10', url: 'http://127.0.0.1:' + s10.port() + '/mcp' }],
+  dataFile: dataFile + '.s10',
+  probeIntervalMs: 5000,
+})
+await pool10.probe()
+const b10a = await pool10.bind('sess-K')
+check('首次绑定成功拉取工具列表', Array.isArray(b10a.tools) && b10a.toolsCount === 4, JSON.stringify(b10a.tools).slice(0, 100))
+s10.setFailToolsList(true)
+const b10b = await pool10.bind('sess-K', { force: true })
+check('tools/list 失败回退缓存列表 + toolsError', Array.isArray(b10b.tools) && b10b.toolsCount === 4 && /tools\/list boom/.test(b10b.toolsError || ''), JSON.stringify(b10b).slice(0, 250))
+pool10.stop()
 
 // ---------- v0.3.7 忙时等待 + 失败附状态 ----------
 // 忙时等待：2 次忙探测 + 1 次空闲 → 等待后调用成功
@@ -672,9 +724,80 @@ check('状态携带：Game 截图成功且落盘', byKey.gameShot && byKey.gameS
 check('状态携带：Scene 截图成功且落盘', byKey.sceneShot && byKey.sceneShot.ok === true && byKey.sceneShot.file && byKey.sceneShot.file.endsWith('scene.png'), JSON.stringify(byKey.sceneShot))
 check('状态携带：选中项包含 Cube', byKey.selection && byKey.selection.ok === true && /Cube/.test(byKey.selection.text), JSON.stringify(byKey.selection).slice(0, 200))
 check('状态携带：ui-snapshot 含节点树', byKey.uiSnapshot && byKey.uiSnapshot.ok === true && /UI Snapshot/.test(byKey.uiSnapshot.text || ''), JSON.stringify(byKey.uiSnapshot).slice(0, 200))
+check('状态携带：ui-snapshot 含引用明细（Refs/Backrefs 可见）', byKey.uiSnapshot && /Refs \(outgoing\):/.test(byKey.uiSnapshot.text || '') && /Cube\.Comp\.fieldA/.test(byKey.uiSnapshot.text || '') && /Backrefs \(incoming/.test(byKey.uiSnapshot.text || ''), JSON.stringify(byKey.uiSnapshot).slice(0, 300))
+// v0.4.1 规则压缩（2026-08-20 用户要求提信息密度）：树去 rect、(inactive) 聚合、重复子树占位、Refs 同源聚合
+const snapTxt = (byKey.uiSnapshot && byKey.uiSnapshot.text) || ''
+check('压缩：树已去掉 rect 坐标', !/rect:\[/.test(snapTxt), snapTxt.slice(0, 200))
+check('压缩：未激活聚合（头部声明，行内无 (inactive)）', /inactive 标记已省略/.test(snapTxt) && !/\(inactive\)/.test(snapTxt), snapTxt.slice(0, 200))
+check('压缩：重复子树聚合占位（Template 只保留一份）', /重复子树/.test(snapTxt), snapTxt.slice(0, 300))
+check('压缩：名字数字归一聚合（label_0_1 同构被占位，label_0_0 保留）', /label_0_0/.test(snapTxt) && !/label_0_1/.test(snapTxt), snapTxt.slice(0, 300))
+check('压缩：Refs 同源聚合（fieldB 不再重复来源前缀）', /fieldB -> \[109\] TargetB/.test(snapTxt) && !/\[101\] Cube\.Comp\.fieldB/.test(snapTxt), snapTxt.slice(0, 400))
+check('压缩：Refs 连续相同行合并 ×N（fieldC ×2）', /fieldC -> \[111\] TargetC ×2/.test(snapTxt), snapTxt.slice(0, 400))
+check('压缩：Backrefs 同目标合并为逗号列表', /\[102\] <- \[101\] Cube\.Comp\.fieldA, \[104\] Viewport\.Image\.m_Sprite/.test(snapTxt), snapTxt.slice(0, 400))
+// ui_snapshot 必须包含未激活物体（选中项常是隐藏 UI 面板；false 会返回 0 nodes 空快照——2026-08-20 实测）
+const snapCall = sState.calls.find(c => c.tool === 'ui_snapshot')
+check('状态携带：ui_snapshot 调用含 include_inactive=true', Boolean(snapCall) && snapCall.args.include_inactive === true, JSON.stringify(snapCall && snapCall.args))
+check('状态携带：ui_snapshot 调用含 names_in_refs=true（引用带名字）', Boolean(snapCall) && snapCall.args.names_in_refs === true, JSON.stringify(snapCall && snapCall.args))
+check('状态携带：ui_snapshot 缓存优先（force_refresh=false，不再每次全量重扫）', Boolean(snapCall) && snapCall.args.force_refresh === false, JSON.stringify(snapCall && snapCall.args))
 check('状态携带：序列化字段含组件与字段数', byKey.serialized && byKey.serialized.ok === true && /BoxCollider/.test(byKey.serialized.text || '') && /组件数 2/.test(byKey.serialized.text || ''), JSON.stringify(byKey.serialized).slice(0, 200))
 check('状态携带：Console 全文含 mock 日志', byKey.consoleAll && byKey.consoleAll.ok === true && /mock console line 1/.test(byKey.consoleAll.text || ''), JSON.stringify(byKey.consoleAll).slice(0, 200))
 check('状态携带：Console 选中条目含 ACTIVE_TEXT', byKey.consoleSelected && byKey.consoleSelected.ok === true && /ACTIVE_TEXT/.test(byKey.consoleSelected.text || ''), JSON.stringify(byKey.consoleSelected).slice(0, 200))
+
+// ---- 快照地图模式（v0.4.1）：Library JSON 生成分层地图（概览/分支/业务引用/锚点/定位） ----
+const mapFile = path.join(dir, 'snap-map.json')
+await fsp.writeFile(mapFile, JSON.stringify({
+  version: '1.0', generatedAt: new Date().toISOString(),
+  roots: [101],
+  nodes: [
+    { id: 101, name: '设备健康度', parentId: 0, path: '外部Canvas/设备健康度', active: true, components: [] },
+    { id: 102, name: 'Btn详情', parentId: 101, path: '外部Canvas/设备健康度/Btn详情', active: true, components: ['Image', 'Button'] },
+    { id: 103, name: 'BarChart', parentId: 101, path: '外部Canvas/设备健康度/BarChart', active: true, components: ['BarChart', 'TSViewPanel'] },
+    { id: 104, name: 'painter_0', parentId: 103, path: '外部Canvas/设备健康度/BarChart/painter_0', active: true, components: ['Painter'] },
+    { id: 105, name: 'painter_1', parentId: 103, path: '外部Canvas/设备健康度/BarChart/painter_1', active: true, components: ['Painter'] },
+    { id: 106, name: 'popup', parentId: 101, path: '外部Canvas/设备健康度/popup', active: true, components: ['HealthPopupController'] },
+    { id: 107, name: 'text', parentId: 106, path: '外部Canvas/设备健康度/popup/text', active: true, components: ['Text'] },
+  ],
+  refs: [
+    { sourceId: 103, sourceComponent: 'BarChart', field: 'm_Font', targetId: 200, targetType: 'Font', targetKind: 'Asset', targetGoId: 0 },
+    { sourceId: 103, sourceComponent: 'BarChart', field: 'm_Font', targetId: 200, targetType: 'Font', targetKind: 'Asset', targetGoId: 0 },
+    { sourceId: 103, sourceComponent: 'BarChart', field: 'm_Font', targetId: 200, targetType: 'Font', targetKind: 'Asset', targetGoId: 0 },
+    { sourceId: 106, sourceComponent: 'HealthPopupController', field: 'barNotifier', targetId: 108, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 108 },
+    { sourceId: 106, sourceComponent: 'HealthPopupController', field: 'btnClose', targetId: 102, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 102 },
+    { sourceId: 102, sourceComponent: 'Button', field: 'm_OnClick[0]', targetId: 106, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 106, method: 'SetActive' },
+  ],
+}, null, 2))
+sState.setSnapshotFile(mapFile)
+for (let i = 0; i < 60 && poolState._stateCollecting; i++) await new Promise(r => setTimeout(r, 50))
+let cacheMap = await poolState.collectState('sess-S')
+if (!cacheMap) { for (let i = 0; i < 60 && poolState._stateCollecting; i++) await new Promise(r => setTimeout(r, 50)); cacheMap = await poolState.collectState('sess-S') }
+const mapTxt = ((cacheMap?.entries || []).find(e => e.key === 'uiSnapshot') || {}).text || ''
+check('地图：注入为分层地图（头/根/分支/业务引用/锚点/定位）', /UI Snapshot 地图/.test(mapTxt) && /根: \[101\]设备健康度/.test(mapTxt) && /分支/.test(mapTxt) && /业务引用/.test(mapTxt) && /锚点/.test(mapTxt) && /定位: /.test(mapTxt), mapTxt.slice(0, 300))
+check('地图：分支索引含节点数与自定义组件', /BarChart \[3 节点 R:3\]/.test(mapTxt) && /BarChart,Painter,TSViewPanel/.test(mapTxt), mapTxt.slice(0, 400))
+check('地图：业务引用含自定义字段与 m_OnClick', /HealthPopupController\.barNotifier/.test(mapTxt) && /m_OnClick\[0\]/.test(mapTxt), mapTxt.slice(0, 500))
+check('地图：资源/自引用噪音聚合（m_Font ×3 不逐条）', /资源\/自引用聚合/.test(mapTxt) && /BarChart\.m_Font ×3/.test(mapTxt) && !/m_Font -> /.test(mapTxt), mapTxt.slice(0, 600))
+check('地图：锚点含高价值/自定义组件节点', /\[103\] BarChart/.test(mapTxt) && /\[106\] popup/.test(mapTxt), mapTxt.slice(0, 600))
+sState.setSnapshotFile(null)
+
+// ---- 忙时跳过采集（v0.4.1，2026-08-20 用户第 3 次遇到「Unity 反复读条」）：Unity 编译/读条期间不采集 ----
+const sBusy = makeMcpServer([{ id: 'ProjB2@bbbb3333', name: 'ProjB2', hash: 'bbbb3333' }], { busyPattern: [true, true, false] })
+await sBusy.listen()
+const poolBusy = createPool(ctx, {
+  services: [{ id: 'SB', name: '服务B', url: 'http://127.0.0.1:' + sBusy.port() + '/mcp' }],
+  dataFile: dataFile + '.busy',
+  probeIntervalMs: 5000,
+  stateEnabled: true,
+  stateSelection: true,
+})
+await poolBusy.probe()
+await poolBusy.bind('sess-B')
+await new Promise(r => setTimeout(r, 200)) // 等 bind 触发的异步采集（消耗 busyPattern[0]=true → 跳过）
+for (let i = 0; i < 60 && poolBusy._stateCollecting; i++) await new Promise(r2 => setTimeout(r2, 50))
+const busyCache = await poolBusy.collectState('sess-B')
+check('忙时跳过：Unity 读条期间 collectState 返回 null（不采集，保留旧缓存）', busyCache === null, JSON.stringify(busyCache))
+const busyCache2 = await poolBusy.collectState('sess-B')
+check('忙时跳过：读条结束（busyPattern 耗尽）后采集恢复', busyCache2 === null || Array.isArray(busyCache2.entries), JSON.stringify(busyCache2))
+poolBusy.stop(); sBusy.close()
+fsp.rm(dataFile + '.busy', { force: true }).catch(() => {})
 
 // 截图 PNG 实际落盘且是合法 PNG
 const fsState = await import('node:fs')
@@ -687,6 +810,18 @@ const ctxText = poolState.stateContextText('sess-S')
 check('状态携带：context 文本含 unity_pool_state 标记', ctxText.includes('<unity_pool_state>') && ctxText.includes('</unity_pool_state>'))
 check('状态携带：context 文本含 Game 截图路径与 read_image 提示', /Game 视图截图/.test(ctxText) && /read_image/.test(ctxText), ctxText.slice(0, 300))
 check('状态携带：context 文本含选中项/序列化/Console 各段', /当前选中项/.test(ctxText) && /选中物体序列化字段/.test(ctxText) && /Console 全文/.test(ctxText) && /Console 选中条目/.test(ctxText), ctxText.slice(0, 400))
+
+// 截图按需采集（v0.4.1）：后台轮询跳过截图（截图闪 Unity 窗口/任务栏提醒）；完整采集才含截图。
+// 注意：stateContextText 可能已触发异步截图补采（截图过期时），这里再显式做一轮完整采集拿含截图的缓存。
+const cacheSkip = await poolState.collectState('sess-S', { skipScreenshots: true })
+const byKeySkip = Object.fromEntries((cacheSkip?.entries || []).map(e => [e.key, e]))
+check('截图按需采集：skipScreenshots 轮询不含截图条目', Boolean(cacheSkip) && !byKeySkip.gameShot && !byKeySkip.sceneShot && byKeySkip.selection && byKeySkip.consoleAll, 'keys=' + Object.keys(byKeySkip).join(','))
+check('截图按需采集：view.state 含 screenshotStaleMs', poolState.view('sess-S').state.screenshotStaleMs === 10000, JSON.stringify(poolState.view('sess-S').state.screenshotStaleMs))
+// 完整采集（含截图）恢复缓存，供后续断言使用
+await new Promise(r => setTimeout(r, 100))
+let cacheFull = await poolState.collectState('sess-S')
+if (!cacheFull) { for (let i = 0; i < 60 && poolState._stateCollecting; i++) await new Promise(r => setTimeout(r, 50)); cacheFull = await poolState.collectState('sess-S') }
+check('截图按需采集：完整采集恢复截图条目', Boolean(cacheFull) && cacheFull.entries.some(e => e.key === 'gameShot' && e.ok), JSON.stringify(cacheFull && cacheFull.entries.map(e => e.key)))
 
 // 防超长：stateMaxChars=40 → 选中项被截断并标注
 const poolTiny = createPool(ctx, {
@@ -713,6 +848,7 @@ check('防超长：context 注入截断文本', /已截断/.test(poolTiny.stateC
 check('状态开关：setStateSwitch 关闭总开关后 context 空串', (poolTiny.setStateSwitch('stateEnabled', false), poolTiny.stateContextText('sess-T2') === ''))
 check('状态开关：setStateSwitch 重新开启', (poolTiny.setStateSwitch('stateEnabled', true), poolTiny.stateContextText('sess-T2') !== ''))
 check('状态开关：setStateSwitch 未知 key 拒绝', (() => { try { poolTiny.setStateSwitch('nope', true); return false } catch { return true } })())
+check('状态开关：switchLog 记录写入流水', Array.isArray(poolTiny.stateSwitchLog) && poolTiny.stateSwitchLog.some(e => e.key === 'stateEnabled' && e.value === true) && poolTiny.stateSwitchLog.length <= 40)
 
 // 单项失败不阻断：ui_snapshot 工具未注册（调用失败）→ 该项 error，其余照常
 const sNoSnap = makeMcpServer([{ id: 'ProjN@nnnn4444', name: 'ProjN', hash: 'nnnn4444' }], { failTool: 'ui_snapshot' })
@@ -739,6 +875,17 @@ check('单项失败不阻断：ui-snapshot 采集失败标注', nSnap && nSnap.o
 check('单项失败不阻断：失败项进 context 文本', /采集失败/.test(poolNoSnap.stateContextText('sess-N')))
 check('单项失败不阻断：选中项仍成功', nSel && nSel.ok === true, JSON.stringify(nSel))
 
+// 选中项非 GameObject（如 Project 资产）：失败信息必须附带选中项摘要（注入块直接可见“选中了什么”）
+sNoSnap.setSelectionResult('count=1\n- SomeTexture | type=Texture2D')
+await new Promise(r => setTimeout(r, 100))
+let cacheN2 = await poolNoSnap.collectState('sess-N')
+if (!cacheN2) {
+  for (let i = 0; i < 60 && poolNoSnap._stateCollecting; i++) await new Promise(r => setTimeout(r, 50))
+  cacheN2 = await poolNoSnap.collectState('sess-N')
+}
+const nSnap2 = cacheN2.entries.find(e => e.key === 'uiSnapshot')
+check('非 GameObject 选中项：失败信息附带选中项摘要', nSnap2 && nSnap2.ok === false && /选中项：/.test(nSnap2.error || '') && /SomeTexture/.test(nSnap2.error || ''), JSON.stringify(nSnap2))
+
 // 未绑定会话：collectState 返回 null
 check('状态携带：未绑定会话采集返回 null', (await poolState.collectState('sess-UNBOUND')) === null)
 
@@ -760,6 +907,92 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
   await handler(fakeReq('GET', '/unity-pool/api/state?sessionId=sess-T'), res)
   const pb = JSON.parse(res._out.body)
   check('HTTP GET /api/state 返回 cache/view', pb.ok === true && pb.value.view && typeof pb.value.sessionId === 'string')
+}
+
+// ---------- v0.4.0 UX：每回合状态只注入一次（同回合共享同一 turn 信号） ----------
+{
+  // fakeRes 变体：end() 时 resolve，用于异步 POST 断言
+  function pRes() {
+    const out = { status: 0, body: '' }
+    let resolveEnd
+    const done = new Promise(r => { resolveEnd = r })
+    const res = { writeHead(s) { out.status = s; return this }, end(b) { out.body = String(b); resolveEnd(out); return this }, _out: out }
+    return { res, done }
+  }
+  async function postJson(url, body) {
+    const { res, done } = pRes()
+    const req = fakeReq('POST', url, body)
+    handler(req, res) // 先挂 readJson 监听，再发 data/end
+    req._emit('data', Buffer.from(JSON.stringify(body)))
+    req._emit('end')
+    await done
+    return JSON.parse(res._out.body)
+  }
+  // 归档测试把 sess-T 解绑了，且池未重新探测（ProjB 不在缓存），改绑仍在列表的 ProjA
+  const rebind = await bindTool.execute({ instance: 'ProjA@aaaa1111' }, { agent: { id: 'sess-T' } })
+  check('状态注入：重新绑定 sess-T', rebind.instanceId === 'ProjA@aaaa1111')
+  const rA = await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateEnabled', value: true })
+  const rB = await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateSelection', value: true })
+  check('状态开关：HTTP 切换总开关+子项成功', rA.ok === true && rB.ok === true && rB.value.state.enabled === true && rB.value.state.switches.stateSelection === true)
+  // 等采集缓存就绪（轮询 GET，不在注入路径上记录信号）
+  let ready = false
+  for (let i = 0; i < 60 && !ready; i++) {
+    const res = fakeRes()
+    await handler(fakeReq('GET', '/unity-pool/api/state?sessionId=sess-T'), res)
+    const pb = JSON.parse(res._out.body)
+    ready = !!(pb.value && pb.value.view && pb.value.view.state && pb.value.view.state.cache
+      && Array.isArray(pb.value.view.state.cache.entries) && pb.value.view.state.cache.entries.length > 0)
+    if (!ready) await new Promise(res2 => setTimeout(res2, 50))
+  }
+  check('状态注入：采集缓存就绪', ready)
+  const mkAgent = function (turn) {
+    return { agent: { id: 'sess-T', session: { id: 'sess-T', events: turn > 0 ? [{ type: 'turn/start', data: { turn } }] : [] } } }
+  }
+  // v0.4.1：注入策略改为「每步返回相同状态块文本」（不再 stateInjectOnce 每回合一次）——
+  // 去重交给宿主整段 runtime-context 去重（内容未变不注入）；这里断言：任何 step 调用都返回完整状态块
+  const once1 = stateCtx.text(mkAgent(5))
+  const once2 = stateCtx.text(mkAgent(5))
+  check('状态注入：任意 request 携带状态块', once1.includes('<unity_pool_state>') && once1.includes('Unity 状态（'))
+  check('状态注入：同回合后续 request 返回相同状态块（供宿主整段去重）', once2 === once1 && once2.includes('<unity_pool_state>'))
+  check('状态注入：状态块不含采集时间戳（避免每 3s 变化破坏宿主去重）', !/采集于/.test(once1))
+  check('状态注入：stateTurnOf 读 turn/start 回合号', poolState.stateTurnOf({ session: { events: [{ type: 'turn/start', data: { turn: 9 } }] } }) === 9)
+  check('状态注入：stateTurnOf 无 events 返回 -1', poolState.stateTurnOf({ session: {} }) === -1)
+  check('状态注入：stateTurnOf 空事件表返回 0', poolState.stateTurnOf({ session: { events: [] } }) === 0)
+
+  // v0.4.1 回合缓存（2026-08-20 用户纠正设计）：同回合内 Unity 状态变化不得改变注入文本——
+  // 用户反复选中物体检查时，回合内每步都返回首步的同一份状态块 → 宿主整段去重零注入；新回合才重新生成。
+  // 注：状态注入走 apply 池（sess-T 绑定在 apply 池，其服务是 s1）；无后台轮询（v0.4.1），
+  // 换选中后通过 /api/state-refresh 手动触发采集更新缓存（模拟消息驱动采集）。
+  s1.setSelectionResult('count=1\n- OtherCube | type=GameObject | id=-202 | path=Root/Other')
+  const rRefresh = await postJson('/unity-pool/api/state-refresh', { sessionId: 'sess-T' })
+  check('状态注入：state-refresh 手动触发采集成功', rRefresh.ok === true && rRefresh.value && rRefresh.value.cache, JSON.stringify(rRefresh).slice(0, 200))
+  const once5 = stateCtx.text(mkAgent(5)) // 同回合（turn 5）→ 必须返回首步缓存（回合号单调，回头访问旧回合）
+  check('状态注入：★ 同回合内状态变化不改变注入文本（回合缓存，不再每步注入）', once5 === once1, once5 === once1 ? 'same' : 'CHANGED: ' + once5.slice(0, 120))
+  const once6 = stateCtx.text(mkAgent(7)) // 新回合 → 重新生成并携带最新状态
+  check('状态注入：新回合重新生成（携带最新状态 OtherCube）', once6 !== once1 && /OtherCube/.test(once6), once6.slice(0, 160))
+  const once3 = stateCtx.text(mkAgent(6)) // 另一新回合 → 同样携带最新状态
+  const once4 = stateCtx.text(mkAgent(0)) // 无回合号 → 每次重新生成
+  check('状态注入：新回合同样返回状态块', once3.includes('<unity_pool_state>'))
+  check('状态注入：无回合号同样返回状态块', once4.includes('<unity_pool_state>'))
+
+  // 状态开关持久化（v0.4.1）：setStateSwitch 写入 dataFile，重建 pool 后恢复上次设置（含"关"）
+  await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateSelection', value: false })
+  await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateConsoleAll', value: true })
+  await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateEnabled', value: false }) // 还原总开关（持久化里应为 false）
+  const stateFileRaw = JSON.parse(await fsp.readFile(dataFile + '.apply', 'utf8'))
+  check('状态持久化：dataFile 含 stateSwitches 且为最新值', stateFileRaw.stateSwitches
+    && stateFileRaw.stateSwitches.stateEnabled === false && stateFileRaw.stateSwitches.stateConsoleAll === true
+    && stateFileRaw.stateSwitches.stateSelection === false, JSON.stringify(stateFileRaw.stateSwitches))
+  const poolReborn = createPool(ctx, {
+    services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + sState.port() + '/mcp' }],
+    dataFile: dataFile + '.apply',
+    probeIntervalMs: 5000,
+    stateEnabled: true, // 配置默认开着，但持久化（false）应覆盖它
+  })
+  check('状态持久化：重建 pool 恢复上次开关状态（覆盖配置默认）',
+    poolReborn.cfg.stateEnabled === false && poolReborn.cfg.stateConsoleAll === true && poolReborn.cfg.stateSelection === false,
+    JSON.stringify({ enabled: poolReborn.cfg.stateEnabled, consoleAll: poolReborn.cfg.stateConsoleAll, selection: poolReborn.cfg.stateSelection }))
+  poolReborn.stop()
 }
 
 poolState.stop(); poolTiny.stop(); poolNoSnap.stop()
