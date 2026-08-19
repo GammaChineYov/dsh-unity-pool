@@ -251,8 +251,11 @@ viewOf.binding = null
 const c1 = chipOf(await settle(ut.Comp, props, 2))
 check('★ 外部解绑后胶囊自动变回 Unity（无需手动刷新）', c1 && c1.label === 'Unity' && c1.dot === '#888', JSON.stringify(c1))
 const dockUnbound = await settle(dock.Comp, props, 2)
-const dockLbl = collect(dockUnbound, n => n.type === 'span' && n.props.children === '未绑定 Unity', [])
-check('★ 解绑后 dock 文本同步为「未绑定 Unity」', dockLbl.length >= 1, 'spans=' + collect(dockUnbound, n => n.type === 'span', []).map(s => s.props.children).join('|'))
+const dockLbl = collect(dockUnbound, n => n.type === 'span' && n.props.children === '未绑定 Unity，绑定后生效', [])
+check('★ 解绑后 dock 文本同步为「未绑定 Unity，绑定后生效」', dockLbl.length >= 1, 'spans=' + collect(dockUnbound, n => n.type === 'span', []).map(s => s.props.children).join('|'))
+// v0.4.2：未绑定也可切开关（预配置，绑定后生效）——总开关 checkbox 不再 disabled:!bound
+const dockUnboundInputs = collect(dockUnbound, n => n.type === 'input' && n.props.type === 'checkbox', [])
+check('★ 未绑定 dock 总开关可切（不再 disabled）', dockUnboundInputs.length >= 1 && dockUnboundInputs.every(i => i.props.disabled !== true), 'inputs=' + dockUnboundInputs.map(i => String(i.props.disabled)).join(','))
 
 // 模拟外部绑定：改回后轮询感知 → chip 恢复实例名
 viewOf.binding = { serviceId: 'S1', instance: { name: 'ProjX', id: 'ProjX@aaaa1111' } }

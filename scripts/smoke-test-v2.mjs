@@ -844,11 +844,15 @@ const tinySel = cacheTiny.entries.find(e => e.key === 'selection')
 check('防超长：stateMaxChars=40 截断并标注', tinySel.ok === true && /已截断/.test(tinySel.text || '') && tinySel.text.length < 120, JSON.stringify(tinySel).slice(0, 200))
 check('防超长：context 注入截断文本', /已截断/.test(poolTiny.stateContextText('sess-T2')))
 
-// 运行时开关切换（state-switch 同款方法）
-check('状态开关：setStateSwitch 关闭总开关后 context 空串', (poolTiny.setStateSwitch('stateEnabled', false), poolTiny.stateContextText('sess-T2') === ''))
-check('状态开关：setStateSwitch 重新开启', (poolTiny.setStateSwitch('stateEnabled', true), poolTiny.stateContextText('sess-T2') !== ''))
-check('状态开关：setStateSwitch 未知 key 拒绝', (() => { try { poolTiny.setStateSwitch('nope', true); return false } catch { return true } })())
-check('状态开关：switchLog 记录写入流水', Array.isArray(poolTiny.stateSwitchLog) && poolTiny.stateSwitchLog.some(e => e.key === 'stateEnabled' && e.value === true) && poolTiny.stateSwitchLog.length <= 40)
+// 运行时开关切换（state-switch 同款方法；v0.4.2 按会话独立，签名带 sessionId）
+check('状态开关：setStateSwitch 关闭总开关后 context 空串', (poolTiny.setStateSwitch('sess-T2', 'stateEnabled', false), poolTiny.stateContextText('sess-T2') === ''))
+check('状态开关：setStateSwitch 重新开启', (poolTiny.setStateSwitch('sess-T2', 'stateEnabled', true), poolTiny.stateContextText('sess-T2') !== ''))
+check('状态开关：setStateSwitch 未知 key 拒绝', (() => { try { poolTiny.setStateSwitch('sess-T2', 'nope', true); return false } catch { return true } })())
+check('状态开关：setStateSwitch 缺 sessionId 拒绝', (() => { try { poolTiny.setStateSwitch('', 'stateEnabled', true); return false } catch { return true } })())
+check('状态开关：switchLog 记录写入流水（含会话）', Array.isArray(poolTiny.stateSwitchLog) && poolTiny.stateSwitchLog.some(e => e.key === 'stateEnabled' && e.value === true && e.sessionId === 'sess-T2') && poolTiny.stateSwitchLog.length <= 40)
+// v0.4.2 per-session：sess-T2 关闭总开关不影响其他会话（sess-T 的 cfg 默认层与 per-session 层）
+check('状态开关：per-session 隔离——T2 关总开关不影响 T', (poolTiny.setStateSwitch('sess-T2', 'stateEnabled', false), poolTiny.getStateSwitches('sess-T2').stateEnabled === false && poolTiny.stateCarryEnabled('sess-T') === true))
+check('状态开关：per-session 隔离——T 切 selection 只影响自己（T2 的 stateEnabled 仍 false、selection 走 cfg 默认）', (poolTiny.setStateSwitch('sess-T', 'stateSelection', true), poolTiny.getStateSwitches('sess-T').stateSelection === true && poolTiny.getStateSwitches('sess-T2').stateEnabled === false && poolTiny.getStateSwitches('sess-T2').stateSelection === true))
 
 // 单项失败不阻断：ui_snapshot 工具未注册（调用失败）→ 该项 error，其余照常
 const sNoSnap = makeMcpServer([{ id: 'ProjN@nnnn4444', name: 'ProjN', hash: 'nnnn4444' }], { failTool: 'ui_snapshot' })
@@ -975,24 +979,52 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
   check('状态注入：新回合同样返回状态块', once3.includes('<unity_pool_state>'))
   check('状态注入：无回合号同样返回状态块', once4.includes('<unity_pool_state>'))
 
-  // 状态开关持久化（v0.4.1）：setStateSwitch 写入 dataFile，重建 pool 后恢复上次设置（含"关"）
+  // 状态开关持久化（v0.4.1 起；v0.4.2 按会话）：setStateSwitch 写入 dataFile 的
+  // stateSwitchesBySession[sessionId]，重建 pool 后该会话恢复上次设置（含"关"）；其他会话不受影响
   await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateSelection', value: false })
   await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateConsoleAll', value: true })
   await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateEnabled', value: false }) // 还原总开关（持久化里应为 false）
   const stateFileRaw = JSON.parse(await fsp.readFile(dataFile + '.apply', 'utf8'))
-  check('状态持久化：dataFile 含 stateSwitches 且为最新值', stateFileRaw.stateSwitches
-    && stateFileRaw.stateSwitches.stateEnabled === false && stateFileRaw.stateSwitches.stateConsoleAll === true
-    && stateFileRaw.stateSwitches.stateSelection === false, JSON.stringify(stateFileRaw.stateSwitches))
+  const storedSw = stateFileRaw.stateSwitchesBySession && stateFileRaw.stateSwitchesBySession['sess-T']
+  check('状态持久化：dataFile 按会话存 stateSwitchesBySession[sess-T] 且为最新值', storedSw
+    && storedSw.stateEnabled === false && storedSw.stateConsoleAll === true
+    && storedSw.stateSelection === false, JSON.stringify(stateFileRaw.stateSwitchesBySession))
   const poolReborn = createPool(ctx, {
     services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + sState.port() + '/mcp' }],
     dataFile: dataFile + '.apply',
     probeIntervalMs: 5000,
-    stateEnabled: true, // 配置默认开着，但持久化（false）应覆盖它
+    stateEnabled: true, // 配置默认开着，但 sess-T 的 per-session 持久化（false）应覆盖它
   })
-  check('状态持久化：重建 pool 恢复上次开关状态（覆盖配置默认）',
-    poolReborn.cfg.stateEnabled === false && poolReborn.cfg.stateConsoleAll === true && poolReborn.cfg.stateSelection === false,
-    JSON.stringify({ enabled: poolReborn.cfg.stateEnabled, consoleAll: poolReborn.cfg.stateConsoleAll, selection: poolReborn.cfg.stateSelection }))
+  const rebornSw = poolReborn.getStateSwitches('sess-T')
+  const rebornOther = poolReborn.getStateSwitches('sess-OTHER')
+  check('状态持久化：重建后 sess-T 恢复上次开关状态（覆盖配置默认）',
+    rebornSw.stateEnabled === false && rebornSw.stateConsoleAll === true && rebornSw.stateSelection === false,
+    JSON.stringify(rebornSw))
+  check('状态持久化：cfg 配置默认层不被覆盖（stateEnabled 仍 true）', poolReborn.cfg.stateEnabled === true,
+    JSON.stringify({ enabled: poolReborn.cfg.stateEnabled }))
+  check('状态持久化：其他会话不受 sess-T 的 per-session 设置影响（走配置默认）',
+    rebornOther.stateEnabled === true && rebornOther.stateConsoleAll === false && rebornOther.stateSelection === false,
+    JSON.stringify(rebornOther))
   poolReborn.stop()
+
+  // v0.4.2 迁移兼容：旧版全局平铺 stateSwitches（v0.4.1 及之前）作为 base（全局默认层）生效，per-session 覆盖它
+  {
+    const legacyFile = dataFile + '.legacy'
+    await fsp.writeFile(legacyFile, JSON.stringify({ bindings: {}, stateSwitches: { stateEnabled: true, stateUiSnapshot: true, stateSelection: false } }), 'utf8')
+    const poolLegacy = createPool(ctx, {
+      services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + sState.port() + '/mcp' }],
+      dataFile: legacyFile,
+      probeIntervalMs: 5000,
+    })
+    const lg = poolLegacy.getStateSwitches('sess-X')
+    check('迁移：旧全局平铺 stateSwitches 作为 base 生效', lg.stateEnabled === true && lg.stateUiSnapshot === true && lg.stateSelection === false, JSON.stringify(lg))
+    poolLegacy.setStateSwitch('sess-X', 'stateUiSnapshot', false)
+    const lg2 = poolLegacy.getStateSwitches('sess-X')
+    const lgOther = poolLegacy.getStateSwitches('sess-Y')
+    check('迁移：per-session 覆盖 base，其他会话仍吃 base', lg2.stateUiSnapshot === false && lgOther.stateUiSnapshot === true, JSON.stringify({ x: lg2, y: lgOther }))
+    poolLegacy.stop()
+    fsp.rm(legacyFile, { force: true }).catch(() => {})
+  }
 }
 
 poolState.stop(); poolTiny.stop(); poolNoSnap.stop()
