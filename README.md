@@ -88,6 +88,22 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     autoUnbindOnArchive: true # 实例被归档（从池中消失/服务离线）时自动解绑绑定该实例的会话
     unbindOfflineStreak: 2    # 服务离线连续探测次数达到该值才视为归档并自动解绑（防瞬时抖动）
     notifyUnbindOnArchive: true # 归档自动解绑后，向被解绑的会话注入运行时通知（systemPrompt.context，下一轮 request 自动感知）
+    # ---- 状态携带（v0.4.0，默认全关）----
+    stateEnabled: false           # 总开关：每次发出指令时在上下文携带 Unity 状态快照
+    stateGameScreenshot: false    # Game 视图截图（PNG 落盘 stateDir，上下文给路径）
+    stateSceneScreenshot: false   # Scene 视图截图
+    stateSelection: false         # Hierarchy/Project 当前选中项
+    stateUiSnapshot: false        # 选中物体 ui-snapshot 结构快照（需实例注册 ui_snapshot 工具）
+    stateSerialized: false        # 选中物体序列化字段内容（防超长截断）
+    stateConsoleAll: false        # Console 全文（最近 stateConsoleCount 条）
+    stateConsoleSelected: false   # Console 当前选中条目内容
+    stateRefreshMs: 3000          # 状态采集间隔（ms）
+    stateScreenshotMaxRes: 640    # 截图最长边分辨率（px）
+    stateDir: '~/.dsh/unity-pool-state' # 截图 PNG 落盘目录
+    stateMaxChars: 8000           # 通用文本项（选中项/序列化字段）最大字符数
+    stateSnapshotMaxChars: 4000   # ui-snapshot 最大字符数
+    stateConsoleMaxChars: 6000    # Console 文本最大字符数
+    stateConsoleCount: 50         # Console 全文读取条数
 ```
 
 ## Agent 工具
@@ -99,6 +115,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 | `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**首次绑定或跨服务切换时返回该服务 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**，拉取失败附 `toolsError` 不阻断绑定；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
 | `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃） |
 | `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话 |
+| `unity_pool_state` | 查看/刷新本会话的 Unity 状态携带快照（v0.4.0）：立即采集一次并按开关返回各项状态（截图文件路径/选中项/序列化字段/Console）+ view.state（开关值与缓存摘要）；`refresh:false` 只读缓存 |
 
 `unity_mcp` 参数：`tool`（mcp-for-unity 工具名，如 manage_scene / manage_gameobject / manage_camera / read_console）、`params`（工具参数对象）、`instance`（可选临时覆盖）。
 
@@ -109,11 +126,14 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 - `POST /unity-pool/api/scan` `{sessionId}` —— 重探+扫描；
 - `POST /unity-pool/api/bind` `{sessionId, instance?, serviceId?, force?}` —— 锁定目标实例（首次绑定/跨服务切换时返回附带 `tools`）；
 - `POST /unity-pool/api/unbind` `{sessionId}` —— 释放。
+- `GET /unity-pool/api/state?sessionId=<id>` —— 当前状态携带缓存与视图；
+- `POST /unity-pool/api/state-refresh` `{sessionId}` —— 立即重新采集一次状态；
+- `POST /unity-pool/api/state-switch` `{sessionId, key, value}` —— 运行时切换状态开关（key: stateEnabled / stateGameScreenshot / stateSceneScreenshot / stateSelection / stateUiSnapshot / stateSerialized / stateConsoleAll / stateConsoleSelected，无需重启）。
 
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 82 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 117 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
@@ -128,3 +148,4 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 82 项：mo
 - `0.3.7` **忙时等待 + 失败附状态**：① `unity_mcp` 转发前用 `execute_code` 探测 Unity 编辑器忙状态（isCompiling/isUpdating/Progress），忙则按 `busyWaitIntervalMs` 间隔重试，总时长不超过 `busyMaxWaitMs`（默认 10s）；探测失败视为"可能忙"（域重载窗口 execute_code 可能不可用）保守等待后继续；② 调用最终失败（isError）时把最近一次探测状态附到返回 `editorState`；关闭 `busyWaitEnabled` 可跳过忙时等待（仅失败时补一次探测附状态）。真实服务联调验证通过（失败返回带 `editorState: isCompiling=0,isUpdating=0,progressCount=0`）。
 - `0.3.8` **归档自动解绑**：每次探活（probe）完成后检查会话绑定——绑定实例不在最新发现列表（`instance-archived`）、服务连续离线达阈值（`service-offline`，`unbindOfflineStreak` 默认 2 防瞬时抖动）、服务配置不存在（`service-removed`）时自动解绑该会话（删除绑定 + 关闭 MCP 会话 + 持久化），避免会话停留在已归档实例上；实例发现失败（`instancesValid=false`）保留上次列表不清空、不据此判归档（发现失败≠实例消失）；新增配置 `autoUnbindOnArchive`（默认 true）/ `unbindOfflineStreak`（默认 2），view 暴露 `instancesValid`/`offlineStreak`/`lastAutoUnbind`，HTTP /api/config 同步返回；测试扩到 76 项。
 - `0.3.9` **归档解绑动态通知**：注册 `systemPrompt.context('unity-pool:archive')`（text 为函数，每次 agent request 前求值——官方机制，sandbox-policy 同款）；自动解绑后只向被解绑的会话注入中文通知（时间/实例/原因 + 重新 bind 指引），其他会话注入空串，下一轮 request 自动感知，无需碰 `unity_mcp` 才撞上「未锁定」报错；新增配置 `notifyUnbindOnArchive`（默认 true），view.rules / HTTP /api/config 同步返回；测试扩到 82 项。
+- `0.4.0` **状态携带（每次发出指令携带 Unity 状态）**：总开关 `stateEnabled` + 7 项子开关（`stateGameScreenshot`/`stateSceneScreenshot`/`stateSelection`/`stateUiSnapshot`/`stateSerialized`/`stateConsoleAll`/`stateConsoleSelected`），**默认全关**；后台采集器（`stateRefreshMs` 周期）对已绑定会话采集开启项到缓存——game/scene 视图截图（`manage_camera` include_image，base64 解码 PNG 落盘 `stateDir/<sessionId>/`，上下文给文件路径），当前选中项（`execute_code` 读 `UnityEditor.Selection`），选中物体 ui-snapshot（`ui_snapshot` 工具）与序列化字段（`mcpforunity://.../components` 资源，均防超长截断 `stateMaxChars`），Console 全文（`read_console`）与 Console 选中条目（反射 `ConsoleWindow.m_ActiveText`）；注册 `systemPrompt.context('unity-pool:state')` 同步注入每轮 request；新增 `unity_pool_state` 工具 + HTTP `/api/state`、`/api/state-refresh`、`/api/state-switch`；view.state / HTTP /api/config 同步返回；测试扩到 117 项。

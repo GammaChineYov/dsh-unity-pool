@@ -86,6 +86,20 @@ function makeMcpServer(instances, opts = {}) {
       result = {
         contents: [{ type: 'text', text: JSON.stringify({ success: true, transport: 'http', instance_count: instances.length, instances }) }],
       }
+    } else if (method === 'resources/read' && msg.params && /^mcpforunity:\/\/scene\/gameobject\/\d+\/components$/.test(msg.params.uri)) {
+      // 选中物体序列化字段（v0.4.0 状态携带）
+      result = {
+        contents: [{ type: 'text', text: JSON.stringify({
+          success: true, message: null, error: null,
+          data: {
+            gameObjectID: 101, gameObjectName: 'Cube',
+            components: [
+              { typeName: 'UnityEngine.Transform', instanceID: 102, properties: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, localScale: { x: 1, y: 1, z: 1 }, m_ConstrainProportionsScale: false, m_Children: [], m_Father: null } },
+              { typeName: 'UnityEngine.BoxCollider', instanceID: 103, properties: { center: { x: 0, y: 0, z: 0 }, size: { x: 1, y: 1, z: 1 }, isTrigger: false, m_Material: null } },
+            ],
+          },
+        }) }],
+      }
     } else if (method === 'tools/call') {
       const name = msg.params.name
       const args = msg.params.arguments || {}
@@ -99,13 +113,21 @@ function makeMcpServer(instances, opts = {}) {
           result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Active instance set to ' + found.id, data: { instance: found.id, session_id: sid } }) }] }
         }
       } else if (name === 'execute_code') {
-        // 忙状态探测：按 busyPattern 消费（true=忙, false=空闲, 'error'=探测报错），耗尽后默认空闲
         probes.push({ sessionId: sid, active: st.active })
-        const b = busyPattern.length > 0 ? busyPattern.shift() : false
-        if (b === 'error') {
-          result = { isError: true, content: [{ type: 'text', text: 'execute_code boom' }] }
+        const code = String(args.code || '')
+        // v0.4.0 状态携带：Selection 读取代码 → 回显选中项；Console 选中反射代码 → 回显条目文本
+        if (code.includes('UnityEditor.Selection.objects')) {
+          result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: 'count=1\n- Cube | type=GameObject | id=101 | path=Root/Cube', compiler: 'roslyn' } }) }] }
+        } else if (code.includes('ConsoleWindow')) {
+          result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: 'selectedRow=3\nACTIVE_TEXT:\n[传输>>] mock console selected entry (at Assets/Test.cs:10)', compiler: 'roslyn' } }) }] }
         } else {
-          result = { content: [{ type: 'text', text: b ? 'c=1;u=1;p=2' : 'c=0;u=0;p=0' }] }
+          // 忙状态探测：按 busyPattern 消费（true=忙, false=空闲, 'error'=探测报错），耗尽后默认空闲
+          const b = busyPattern.length > 0 ? busyPattern.shift() : false
+          if (b === 'error') {
+            result = { isError: true, content: [{ type: 'text', text: 'execute_code boom' }] }
+          } else {
+            result = { content: [{ type: 'text', text: b ? 'c=1;u=1;p=2' : 'c=0;u=0;p=0' }] }
+          }
         }
       } else {
         calls.push({ sessionId: sid, active: st.active, tool: name, args })
@@ -113,11 +135,21 @@ function makeMcpServer(instances, opts = {}) {
           result = { isError: true, content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'no active instance; available: ' + instances.map(i => i.id).join(',') }) }] }
         } else if (opts.failTool && name === opts.failTool) {
           result = { isError: true, content: [{ type: 'text', text: 'tool boom: ' + name }] }
+        } else if (name === 'ui_snapshot') {
+          // v0.4.0 状态携带：ui-snapshot 快照（自定义工具，LBTools 风格返回）
+          result = {
+            content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'UI snapshot - 2 nodes, 1 refs', error: null, data: { summary: { nodeCount: 2, refCount: 1, backrefCount: 0, rootCount: 1, cached: false, libraryPath: 'Library/LBTools/UISnapshots/mock.json', markdownPath: 'Library/LBTools/UISnapshots/mock.md' }, roots: [{ instanceID: 101 }], text: '# UI Snapshot: 2 nodes, 1 refs\r\nRoots: [101]\r\nTree:\r\n- [101] Cube (Transform,BoxCollider) R:1 B:0\r\n  - [102] Child (Transform) R:0 B:1' } }) }],
+          }
+        } else if (name === 'read_console' && args.action === 'get') {
+          // v0.4.0 状态携带：Console 全文
+          result = {
+            content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Retrieved 3 log entries.', data: ['mock console line 1', 'mock console line 2', 'mock console line 3'] }) }],
+          }
         } else if (name === 'manage_camera' && args.action === 'screenshot') {
           // 模拟官方 manage_camera include_image=true 的 ImageContent 块
           result = {
             content: [
-              { type: 'text', text: JSON.stringify({ success: true, data: { width: 640, height: 480 } }) },
+              { type: 'text', text: JSON.stringify({ success: true, data: { width: 640, height: 480, imageWidth: 320, imageHeight: 180 } }) },
               { type: 'image', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', mimeType: 'image/png' },
             ],
           }
@@ -312,7 +344,7 @@ const fakeCtx = {
   webServer: { register(route) { routes.push(route); return () => {} } },
 }
 apply(fakeCtx, { services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }], dataFile: dataFile + '.apply', probeIntervalMs: 5000 })
-check('apply：注册 5 个工具', registered.length === 5 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_mcp','unity_pool_unbind'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
+check('apply：注册 6 个工具', registered.length === 6 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
 check('apply：系统提示段含 unity_mcp', sections.some(s => s.name === 'unity-pool' && /unity_mcp/.test(s.text)))
 check('apply：HTTP 路由注册', routes.length === 1 && routes[0].path === '/unity-pool/api')
 
@@ -591,6 +623,151 @@ await poolA2.probe()
 check('持久化：重建后 sess-K/sess-L 均未残留', poolA2.bindingOf('sess-K') === null && poolA2.bindingOf('sess-L') === null)
 poolA2.stop()
 sA.close()
+
+// ---------- v0.4.0 状态携带 ----------
+// 默认全关：不显式传 state* → enabled=false，stateCarryEnabled=false，context 注入空串
+check('状态携带：默认 stateEnabled=false', poolA2.cfg.stateEnabled === false)
+check('状态携带：默认所有子开关 false', ['stateGameScreenshot','stateSceneScreenshot','stateSelection','stateUiSnapshot','stateSerialized','stateConsoleAll','stateConsoleSelected'].every(k => poolA2.cfg[k] === false), JSON.stringify(poolA2.cfg))
+check('状态携带：stateCarryEnabled=false（全关）', poolA2.stateCarryEnabled('any') === false)
+check('状态携带：context 注入空串（默认关）', poolA2.stateContextText('any') === '')
+
+// 开启全部开关的池：mock S1 已支持 manage_camera 截图 / ui_snapshot / read_console / execute_code(Selection/Console) / components 资源
+const sState = makeMcpServer([{ id: 'ProjM@mmmm3333', name: 'ProjM', hash: 'mmmm3333' }])
+await sState.listen()
+const stateDir = path.join(dir, 'state-carry')
+const poolState = createPool(ctx, {
+  services: [{ id: 'SS', name: '服务S', url: 'http://127.0.0.1:' + sState.port() + '/mcp' }],
+  dataFile: dataFile + '.state',
+  probeIntervalMs: 5000,
+  stateEnabled: true,
+  stateGameScreenshot: true,
+  stateSceneScreenshot: true,
+  stateSelection: true,
+  stateUiSnapshot: true,
+  stateSerialized: true,
+  stateConsoleAll: true,
+  stateConsoleSelected: true,
+  stateRefreshMs: 5000,
+  stateScreenshotMaxRes: 320,
+  stateDir,
+  stateMaxChars: 8000,
+  stateSnapshotMaxChars: 4000,
+  stateConsoleMaxChars: 6000,
+  stateConsoleCount: 50,
+})
+await poolState.probe()
+await poolState.bind('sess-S')
+check('状态携带：绑定后 stateCarryEnabled=true', poolState.stateCarryEnabled('sess-S') === true)
+
+// collectState 全项采集（bind 已触发过一次后台采集，轮询等其落定；再显式采一次刷新）
+for (let i = 0; i < 60 && !poolState.stateCaches.has('sess-S'); i++) await new Promise(r => setTimeout(r, 50))
+let cacheS = await poolState.collectState('sess-S')
+if (!cacheS) { // 上轮采集仍持锁（并发极低，几乎不会走到）；再等一轮
+  for (let i = 0; i < 60 && poolState._stateCollecting; i++) await new Promise(r => setTimeout(r, 50))
+  cacheS = await poolState.collectState('sess-S')
+}
+check('状态携带：collectState 返回缓存', Boolean(cacheS) && Array.isArray(cacheS.entries) && cacheS.entries.length >= 7, JSON.stringify(cacheS && cacheS.entries && cacheS.entries.map(e => e.key)).slice(0, 300))
+const byKey = Object.fromEntries((cacheS?.entries || []).map(e => [e.key, e]))
+check('状态携带：Game 截图成功且落盘', byKey.gameShot && byKey.gameShot.ok === true && byKey.gameShot.file && byKey.gameShot.file.endsWith('game.png'), JSON.stringify(byKey.gameShot))
+check('状态携带：Scene 截图成功且落盘', byKey.sceneShot && byKey.sceneShot.ok === true && byKey.sceneShot.file && byKey.sceneShot.file.endsWith('scene.png'), JSON.stringify(byKey.sceneShot))
+check('状态携带：选中项包含 Cube', byKey.selection && byKey.selection.ok === true && /Cube/.test(byKey.selection.text), JSON.stringify(byKey.selection).slice(0, 200))
+check('状态携带：ui-snapshot 含节点树', byKey.uiSnapshot && byKey.uiSnapshot.ok === true && /UI Snapshot/.test(byKey.uiSnapshot.text || ''), JSON.stringify(byKey.uiSnapshot).slice(0, 200))
+check('状态携带：序列化字段含组件与字段数', byKey.serialized && byKey.serialized.ok === true && /BoxCollider/.test(byKey.serialized.text || '') && /组件数 2/.test(byKey.serialized.text || ''), JSON.stringify(byKey.serialized).slice(0, 200))
+check('状态携带：Console 全文含 mock 日志', byKey.consoleAll && byKey.consoleAll.ok === true && /mock console line 1/.test(byKey.consoleAll.text || ''), JSON.stringify(byKey.consoleAll).slice(0, 200))
+check('状态携带：Console 选中条目含 ACTIVE_TEXT', byKey.consoleSelected && byKey.consoleSelected.ok === true && /ACTIVE_TEXT/.test(byKey.consoleSelected.text || ''), JSON.stringify(byKey.consoleSelected).slice(0, 200))
+
+// 截图 PNG 实际落盘且是合法 PNG
+const fsState = await import('node:fs')
+const gamePng = byKey.gameShot && byKey.gameShot.file ? byKey.gameShot.file : path.join(stateDir, 'sess-S', 'game.png')
+const pngBuf = fsState.readFileSync(gamePng)
+check('状态携带：截图文件为合法 PNG（魔数）', pngBuf.length > 8 && pngBuf.subarray(0, 8).toString('hex') === '89504e470d0a1a0a', pngBuf.length + ' bytes')
+
+// stateContextText：缓存注入文本（同步，含截图路径）
+const ctxText = poolState.stateContextText('sess-S')
+check('状态携带：context 文本含 unity_pool_state 标记', ctxText.includes('<unity_pool_state>') && ctxText.includes('</unity_pool_state>'))
+check('状态携带：context 文本含 Game 截图路径与 read_image 提示', /Game 视图截图/.test(ctxText) && /read_image/.test(ctxText), ctxText.slice(0, 300))
+check('状态携带：context 文本含选中项/序列化/Console 各段', /当前选中项/.test(ctxText) && /选中物体序列化字段/.test(ctxText) && /Console 全文/.test(ctxText) && /Console 选中条目/.test(ctxText), ctxText.slice(0, 400))
+
+// 防超长：stateMaxChars=40 → 选中项被截断并标注
+const poolTiny = createPool(ctx, {
+  services: [{ id: 'ST', name: '服务T', url: 'http://127.0.0.1:' + sState.port() + '/mcp' }],
+  dataFile: dataFile + '.tiny',
+  probeIntervalMs: 5000,
+  stateEnabled: true,
+  stateSelection: true,
+  stateMaxChars: 40,
+})
+await poolTiny.probe()
+await poolTiny.bind('sess-T2')
+for (let i = 0; i < 60 && !poolTiny.stateCaches.has('sess-T2'); i++) await new Promise(r => setTimeout(r, 50))
+let cacheTiny = await poolTiny.collectState('sess-T2')
+if (!cacheTiny) {
+  for (let i = 0; i < 60 && poolTiny._stateCollecting; i++) await new Promise(r => setTimeout(r, 50))
+  cacheTiny = await poolTiny.collectState('sess-T2')
+}
+const tinySel = cacheTiny.entries.find(e => e.key === 'selection')
+check('防超长：stateMaxChars=40 截断并标注', tinySel.ok === true && /已截断/.test(tinySel.text || '') && tinySel.text.length < 120, JSON.stringify(tinySel).slice(0, 200))
+check('防超长：context 注入截断文本', /已截断/.test(poolTiny.stateContextText('sess-T2')))
+
+// 运行时开关切换（state-switch 同款方法）
+check('状态开关：setStateSwitch 关闭总开关后 context 空串', (poolTiny.setStateSwitch('stateEnabled', false), poolTiny.stateContextText('sess-T2') === ''))
+check('状态开关：setStateSwitch 重新开启', (poolTiny.setStateSwitch('stateEnabled', true), poolTiny.stateContextText('sess-T2') !== ''))
+check('状态开关：setStateSwitch 未知 key 拒绝', (() => { try { poolTiny.setStateSwitch('nope', true); return false } catch { return true } })())
+
+// 单项失败不阻断：ui_snapshot 工具未注册（调用失败）→ 该项 error，其余照常
+const sNoSnap = makeMcpServer([{ id: 'ProjN@nnnn4444', name: 'ProjN', hash: 'nnnn4444' }], { failTool: 'ui_snapshot' })
+await sNoSnap.listen()
+const poolNoSnap = createPool(ctx, {
+  services: [{ id: 'SN', name: '服务N', url: 'http://127.0.0.1:' + sNoSnap.port() + '/mcp' }],
+  dataFile: dataFile + '.nosnap',
+  probeIntervalMs: 5000,
+  stateEnabled: true,
+  stateSelection: true,
+  stateUiSnapshot: true,
+})
+await poolNoSnap.probe()
+await poolNoSnap.bind('sess-N')
+for (let i = 0; i < 60 && !poolNoSnap.stateCaches.has('sess-N'); i++) await new Promise(r => setTimeout(r, 50))
+let cacheN = await poolNoSnap.collectState('sess-N')
+if (!cacheN) {
+  for (let i = 0; i < 60 && poolNoSnap._stateCollecting; i++) await new Promise(r => setTimeout(r, 50))
+  cacheN = await poolNoSnap.collectState('sess-N')
+}
+const nSnap = cacheN.entries.find(e => e.key === 'uiSnapshot')
+const nSel = cacheN.entries.find(e => e.key === 'selection')
+check('单项失败不阻断：ui-snapshot 采集失败标注', nSnap && nSnap.ok === false && /tool boom/.test(nSnap.error || ''), JSON.stringify(nSnap))
+check('单项失败不阻断：失败项进 context 文本', /采集失败/.test(poolNoSnap.stateContextText('sess-N')))
+check('单项失败不阻断：选中项仍成功', nSel && nSel.ok === true, JSON.stringify(nSel))
+
+// 未绑定会话：collectState 返回 null
+check('状态携带：未绑定会话采集返回 null', (await poolState.collectState('sess-UNBOUND')) === null)
+
+// apply() 装配：注册 unity-pool:state context + unity_pool_state 工具 + HTTP API
+const stateCtx = promptContexts.find(c => c.name === 'unity-pool:state')
+check('apply：注册状态 context（text 为函数）', Boolean(stateCtx) && typeof stateCtx.text === 'function')
+check('apply：注册 unity_pool_state 工具', registered.some(t => t.name === 'unity_pool_state'))
+check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: { id: 'sess-T', session: { id: 'sess-T' } } }) === '')
+// HTTP /api/config 返回 state 字段
+{
+  const res = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/config'), res)
+  const pb = JSON.parse(res._out.body)
+  check('HTTP /api/config 返回 state 开关', pb.ok === true && pb.value.state && pb.value.state.enabled === false && pb.value.state.selection === false)
+}
+// HTTP /api/state 返回缓存
+{
+  const res = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/state?sessionId=sess-T'), res)
+  const pb = JSON.parse(res._out.body)
+  check('HTTP GET /api/state 返回 cache/view', pb.ok === true && pb.value.view && typeof pb.value.sessionId === 'string')
+}
+
+poolState.stop(); poolTiny.stop(); poolNoSnap.stop()
+sState.close(); sNoSnap.close()
+fsp.rm(stateDir, { recursive: true, force: true }).catch(() => {})
+fsp.rm(dataFile + '.state', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.tiny', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.nosnap', { force: true }).catch(() => {})
 
 s1.close(); s2.close(); s3.close(); s4.close(); s5.close()
 fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
