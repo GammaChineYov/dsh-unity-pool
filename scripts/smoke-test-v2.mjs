@@ -497,12 +497,32 @@ check('v0.5.0：已绑定会话调 umcp_manage_scene 成功 active=ProjB', umcpR
   check('v0.5.0：绑 S2 后 umcp_manage_scene 重新注册（接管）', secondSceneRegs === 2, 'regs=' + secondSceneRegs)
   check('v0.5.0：接管时旧注册被注销（disposer 调用）', dis2.includes('umcp_manage_scene'), dis2.join(','))
   check('v0.5.0：nativeToolOwner 指向 S2', pool2b.nativeToolOwner.get('umcp_manage_scene') === 'S2', pool2b.nativeToolOwner.get('umcp_manage_scene'))
-  // 解绑不注销（其他会话可能用）
-  pool2b.unbind('sess-A1')
-  pool2b.unbind('sess-A2')
-  check('v0.5.0：解绑不注销原生工具', pool2b.nativeDisposers.size === 2, 'size=' + pool2b.nativeDisposers.size)
+  // 解绑收敛（v0.5.0）：服务不再被任何会话绑定 → 注销该服务 umcp_*；仍有会话绑定 → 保留
+  pool2b.unbind('sess-A1')   // S1 无其他会话 → 注销 S1
+  check('v0.5.0：解绑后无会话绑定该服务 → 注销原生工具', pool2b.nativeDisposers.size === 1 && !pool2b.nativeDisposers.has('S1'), 'size=' + pool2b.nativeDisposers.size + ' S1=' + pool2b.nativeDisposers.has('S1'))
+  pool2b.unbind('sess-A2')   // S2 无其他会话 → 注销 S2
+  check('v0.5.0：全部解绑后注册清空', pool2b.nativeDisposers.size === 0 && pool2b.nativeToolOwner.size === 0, 'size=' + pool2b.nativeDisposers.size)
   pool2b.stop()
-  check('v0.5.0：stop 后全量注销', pool2b.nativeDisposers.size === 0 && pool2b.nativeToolOwner.size === 0)
+  check('v0.5.0：stop 后全量注销（幂等）', pool2b.nativeDisposers.size === 0 && pool2b.nativeToolOwner.size === 0)
+}
+// 同服务多会话：一个解绑不注销（另一会话仍绑定）
+{
+  const reg3 = []
+  const ctx3 = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { reg3.push(def); return () => {} } } }
+  const pool3 = createPool(ctx3, {
+    services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }],
+    dataFile: dataFile + '.samed',
+    probeIntervalMs: 5000,
+  })
+  await pool3.probe()
+  await pool3.bind('sess-U1', { instance: 'ProjA@aaaa1111' })
+  await pool3.bind('sess-U2', { instance: 'ProjB@bbbb2222' }) // 同服务第二会话
+  check('v0.5.0：同服务两会话各自注册正常', reg3.filter(t => t.name === 'umcp_manage_scene').length === 2, 'regs=' + reg3.length)
+  pool3.unbind('sess-U1')
+  check('v0.5.0：同服务另一会话仍绑定 → 不注销', pool3.nativeDisposers.size === 1 && pool3.nativeDisposers.has('S1'), 'size=' + pool3.nativeDisposers.size)
+  pool3.unbind('sess-U2')
+  check('v0.5.0：同服务最后一个会话解绑 → 注销', pool3.nativeDisposers.size === 0, 'size=' + pool3.nativeDisposers.size)
+  pool3.stop()
 }
 // 禁用 nativeToolsEnabled 时不注册
 {
