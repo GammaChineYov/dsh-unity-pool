@@ -28,8 +28,8 @@ function makeMcpServer(instances, opts = {}) {
   const busyPattern = Array.isArray(opts.busyPattern) ? [...opts.busyPattern] : []
   const tools = opts.toolDefs ? JSON.parse(JSON.stringify(opts.toolDefs)) : [
     { name: 'execute_code', description: '执行任意 C#（忙状态探测）', inputSchema: { type: 'object', properties: { action: { type: 'string' }, code: { type: 'string' } } } },
-    { name: 'manage_scene', description: '场景操作（get_hierarchy 等）', inputSchema: { type: 'object', properties: { action: { type: 'string' } } } },
-    { name: 'manage_gameobject', description: 'GameObject 操作', inputSchema: { type: 'object', properties: { action: { type: 'string' }, name: { type: 'string' } } } },
+    { name: 'manage_scene', description: '场景操作（get_hierarchy 等）', inputSchema: { type: 'object', properties: { action: { type: 'string' } }, required: ['action'] } },
+    { name: 'manage_gameobject', description: 'GameObject 操作', inputSchema: { type: 'object', properties: { action: { type: 'string' }, name: { type: 'string' }, filter: { type: 'object', properties: { name: { type: 'string' } } } } } },
     { name: 'read_console', description: '读控制台', inputSchema: { type: 'object', properties: { count: { type: 'number' } } } },
   ]
   let listCalls = 0
@@ -369,13 +369,14 @@ poolU.stop()
 // ---------- apply() 装配 ----------
 const routes = []
 const registered = []
+const disposed = [] // v0.5.0：记录 tools.register 返回的 disposer 被调用（模拟 DSH 注销）
 const sections = []
 const promptContexts = []
 const fakeCtx = {
   logger: { info() {}, warn() {}, error() {} },
   effect(fn) { fn(); return () => {} },
   inject(services, fn) { fn({ effect: fakeCtx.effect, webServer: fakeCtx.webServer }) },
-  tools: { register(def) { registered.push(def) } },
+  tools: { register(def) { registered.push(def); return () => { disposed.push(def.name) } } },
   systemPrompt: { section(s) { sections.push(s) }, context(c) { promptContexts.push(c) } },
   webServer: { register(route) { routes.push(route); return () => {} } },
 }
@@ -422,6 +423,101 @@ function fakeReq(method, url, body) {
   const res = fakeRes()
   await handler({ method: 'GET', url: '/unity-pool/api/status', headers: { host: 'evil.example.com' }, on() {} }, res)
   check('HTTP 非回环被拒(403)', res._out.status === 403)
+}
+
+// ---------- v0.5.0 原生工具注册（umcp_*，Claude 式工具清单） ----------
+// apply 池的 bind（上面）已触发 syncNativeTools → fakeCtx.tools.register 收到 umcp_* 工具
+const umcpScene = registered.find(t => t.name === 'umcp_manage_scene')
+check('v0.5.0：绑定后注册原生工具 umcp_manage_scene', Boolean(umcpScene), registered.map(t => t.name).join(','))
+check('v0.5.0：umcp 描述含服务与原工具名', Boolean(umcpScene) && /S1/.test(umcpScene.description) && /manage_scene/.test(umcpScene.description), umcpScene && umcpScene.description)
+check('v0.5.0：compact schema 基础标量保留类型', Boolean(umcpScene) && umcpScene.parameters.properties && umcpScene.parameters.properties.action && umcpScene.parameters.properties.action.type === 'string' && typeof umcpScene.parameters.properties.action.description === 'string', JSON.stringify(umcpScene && umcpScene.parameters))
+{
+  // compact：复杂嵌套参数降级（不展开嵌套子 schema，参数由 Unity 侧裁决）
+  const umcpGo = registered.find(t => t.name === 'umcp_manage_gameobject')
+  check('v0.5.0：compact schema 复杂参数不展开嵌套', Boolean(umcpGo) && umcpGo.parameters.properties.filter && umcpGo.parameters.properties.filter.properties === undefined && typeof umcpGo.parameters.properties.filter.description === 'string', JSON.stringify(umcpGo && umcpGo.parameters.properties.filter))
+}
+// 未绑定会话调 umcp_* → proxyMcp 报「未锁定目标实例」
+let unboundErr = null
+try { await umcpScene.execute({ action: 'get_hierarchy' }, { agent: { id: 'sess-UNBOUND' } }) } catch (e) { unboundErr = e.message }
+check('v0.5.0：未绑定会话调 umcp_* 报未锁定', /未锁定目标实例/.test(unboundErr || ''), unboundErr)
+// 已绑定会话（sess-T 绑 ProjB）调 umcp_manage_scene → 成功且 active=ProjB
+const umcpRes = await umcpScene.execute({ action: 'get_hierarchy' }, { agent: { id: 'sess-T' } })
+check('v0.5.0：已绑定会话调 umcp_manage_scene 成功 active=ProjB', umcpRes.success === true && umcpRes.activeInstance === 'ProjB@bbbb2222', JSON.stringify(umcpRes).slice(0, 200))
+// view.nativeTools 摘要
+{
+  const res4 = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/status?sessionId=sess-T'), res4)
+  const pb4 = JSON.parse(res4._out.body)
+  check('v0.5.0：view.nativeTools 含 S1 摘要', Array.isArray(pb4.value.nativeTools) && pb4.value.nativeTools.some(n => n.serviceId === 'S1' && n.count >= 4), JSON.stringify(pb4.value.nativeTools))
+  check('v0.5.0：view.rules 暴露 nativeToolsEnabled/Schema', pb4.value.rules.nativeToolsEnabled === true && pb4.value.rules.nativeToolSchema === 'compact', JSON.stringify(pb4.value.rules))
+}
+// full schema（nativeToolSchema: full）
+{
+  const regF = []
+  const ctxF = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { regF.push(def); return () => {} } } }
+  const poolF = createPool(ctxF, {
+    services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }],
+    dataFile: dataFile + '.full',
+    probeIntervalMs: 5000,
+    nativeToolSchema: 'full',
+  })
+  await poolF.probe()
+  await poolF.bind('sess-F')
+  const umcpFull = regF.find(t => t.name === 'umcp_manage_scene')
+  check('v0.5.0：full schema 参数带完整类型', Boolean(umcpFull) && umcpFull.parameters.properties && umcpFull.parameters.properties.action && umcpFull.parameters.properties.action.type === 'string', JSON.stringify(umcpFull && umcpFull.parameters))
+  check('v0.5.0：full schema 必填进顶层 required 数组', Boolean(umcpFull) && Array.isArray(umcpFull.parameters.required) && umcpFull.parameters.required.includes('action'), JSON.stringify(umcpFull && umcpFull.parameters.required))
+  {
+    // full：复杂嵌套参数展开为 object 子 schema
+    const umcpFullGo = regF.find(t => t.name === 'umcp_manage_gameobject')
+    check('v0.5.0：full schema 复杂参数展开 object', Boolean(umcpFullGo) && umcpFullGo.parameters.properties.filter && umcpFullGo.parameters.properties.filter.type === 'object' && umcpFullGo.parameters.properties.filter.properties.name.type === 'string', JSON.stringify(umcpFullGo && umcpFullGo.parameters.properties.filter))
+  }
+  const beforeDispose = regF.length
+  poolF.stop()
+  check('v0.5.0：stop() 注销全部原生工具（disposer 均被调用）', poolF.nativeDisposers.size === 0 && poolF.nativeToolOwner.size === 0, 'regs=' + poolF.nativeDisposers.size + ' owner=' + poolF.nativeToolOwner.size)
+}
+// 同名刷新 + 跨服务同名接管（S1/S2 都有 manage_scene；S2 绑定后接管 umcp_manage_scene）
+{
+  const reg2 = []
+  const dis2 = []
+  const ctx2 = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { reg2.push(def); return () => { dis2.push(def.name) } } } }
+  const pool2b = createPool(ctx2, {
+    services: [
+      { id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' },
+      { id: 'S2', name: '服务2', url: 'http://127.0.0.1:' + s2.port() + '/mcp' },
+    ],
+    dataFile: dataFile + '.owner',
+    probeIntervalMs: 5000,
+  })
+  await pool2b.probe()
+  await pool2b.bind('sess-A1', { instance: 'ProjA@aaaa1111' }) // S1 → 注册 umcp_*
+  const firstSceneRegs = reg2.filter(t => t.name === 'umcp_manage_scene').length
+  check('v0.5.0：绑 S1 注册 umcp_manage_scene', firstSceneRegs === 1, 'regs=' + firstSceneRegs)
+  await pool2b.bind('sess-A2', { instance: 'ProjC@cccc3333' }) // S2 → 接管同名
+  const secondSceneRegs = reg2.filter(t => t.name === 'umcp_manage_scene').length
+  check('v0.5.0：绑 S2 后 umcp_manage_scene 重新注册（接管）', secondSceneRegs === 2, 'regs=' + secondSceneRegs)
+  check('v0.5.0：接管时旧注册被注销（disposer 调用）', dis2.includes('umcp_manage_scene'), dis2.join(','))
+  check('v0.5.0：nativeToolOwner 指向 S2', pool2b.nativeToolOwner.get('umcp_manage_scene') === 'S2', pool2b.nativeToolOwner.get('umcp_manage_scene'))
+  // 解绑不注销（其他会话可能用）
+  pool2b.unbind('sess-A1')
+  pool2b.unbind('sess-A2')
+  check('v0.5.0：解绑不注销原生工具', pool2b.nativeDisposers.size === 2, 'size=' + pool2b.nativeDisposers.size)
+  pool2b.stop()
+  check('v0.5.0：stop 后全量注销', pool2b.nativeDisposers.size === 0 && pool2b.nativeToolOwner.size === 0)
+}
+// 禁用 nativeToolsEnabled 时不注册
+{
+  const regD = []
+  const ctxD = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { regD.push(def); return () => {} } } }
+  const poolD = createPool(ctxD, {
+    services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }],
+    dataFile: dataFile + '.dis',
+    probeIntervalMs: 5000,
+    nativeToolsEnabled: false,
+  })
+  await poolD.probe()
+  await poolD.bind('sess-D')
+  check('v0.5.0：nativeToolsEnabled=false 不注册 umcp_*', regD.filter(t => t.name.startsWith('umcp_')).length === 0, regD.map(t => t.name).join(','))
+  poolD.stop()
 }
 
 // ---------- v0.3.9 归档解绑动态通知（systemPrompt.context） ----------

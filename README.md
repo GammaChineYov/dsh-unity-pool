@@ -26,6 +26,7 @@ MCP 会话（Session）＝ 每 DSH 会话 × 服务 一个独立 Mcp-Session-Id�
 2. 目标实例不在列表 → `unity_pool_scan`（服务重探 + 实例重读 + 扫描 scanPorts 端口段发现新服务）→ 再 `unity_pool_status`；
 3. 列表含多个实例（如 A/B 在 S1、C 在 S2）→ 调 `unity_pool_bind(instance="ProjB@bbbb2222")` 把本会话目标实例锁定为 B；**每次绑定都返回该服务的最新 MCP 工具列表 `tools`**（含 name/description/inputSchema，同服务重复绑定也重拉保持新鲜，拉取失败回退缓存并附 `toolsError`），可直接据此调用；随时调 `unity_pool_status` 也可查看本会话已绑服务的工具名速查（`tools: {count, names}`）；
 4. 之后所有 MCP 操作走 `unity_mcp(tool=..., params=...)`——插件自动把本会话的 MCP 会话激活到 B（助手无感），转发 tools/call；**请求的工具不在已知列表时自动重拉 tools/list**（Unity 可运行时注册/注销自定义工具、manage_tools 可开关工具组）；**工具名不存在时错误信息会附带当前可用工具名列表（含相似工具名提示）**，从中选正确的名称重试即可，不要盲猜；查 Unity 编辑器状态（截图/选中项/Console 等）用 `unity_pool_state`（状态携带开关默认全关，需先开启）；
+5. **（v0.5.0）绑定后该服务工具自动注册为原生工具 `umcp_<工具名>`**——模型上下文直接可见完整工具清单（含参数），可直接原生调用（等价 `unity_mcp` 转发；未绑定会话调用报「未锁定目标实例」，先 bind 即可）；`umcp_*` 与 `unity_mcp` 等价并存（unity_mcp 仍是通用代理兜底，任意工具名可调）。
 5. 另一个会话锁 A 并行工作：per MCP-Session-Id 隔离，两会话各自 target 各自实例，互不干扰；
 6. 用完 `unity_pool_unbind` 释放。
 
@@ -88,6 +89,9 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     autoUnbindOnArchive: true # 实例被归档（从池中消失/服务离线）时自动解绑绑定该实例的会话
     unbindOfflineStreak: 2    # 服务离线连续探测次数达到该值才视为归档并自动解绑（防瞬时抖动）
     notifyUnbindOnArchive: true # 归档自动解绑后，向被解绑的会话注入运行时通知（systemPrompt.context，下一轮 request 自动感知）
+    # ---- 原生工具注册（v0.5.0，Claude 式工具清单）----
+    nativeToolsEnabled: true   # 绑定成功后把该服务的 MCP 工具动态注册为原生工具（umcp_<工具名>），模型上下文直接可见可调
+    nativeToolSchema: compact  # 参数 schema 形态：compact=基础标量类型+description、复杂参数不展开（省上下文，默认）；full=完整 inputSchema（与 Claude 注册 MCP 工具一致，参数校验最全但上下文开销大）
     # ---- 状态携带（v0.4.0，默认全关）----
     stateEnabled: false           # 总开关：每次发出指令时在上下文携带 Unity 状态快照
     stateGameScreenshot: false    # Game 视图截图（PNG 落盘 stateDir，上下文给路径）
@@ -116,7 +120,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 |------|------|
 | `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活 + instancesValid/offlineStreak）+ 本会话锁定 + 最近归档自动解绑 lastAutoUnbind；**已绑定时附带该服务最新工具名速查 `tools: {count, names}`** |
 | `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务 |
-| `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**每次绑定都返回该服务最新 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**（同服务重复绑定也重拉保持新鲜；拉取失败回退上次缓存并附 `toolsError`，不阻断绑定）；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
+| `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**每次绑定都返回该服务最新 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**（同服务重复绑定也重拉保持新鲜；拉取失败回退上次缓存并附 `toolsError`，不阻断绑定）；**绑定后该服务工具自动注册为原生工具 `umcp_<工具名>`（v0.5.0）**——模型上下文直接可见全部工具名/描述/参数并原生调用（等价 `unity_mcp` 转发，未绑定会话调用报「未锁定目标实例」）；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
 | `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**工具名不存在时错误信息附带当前可用工具名列表（含相似工具名提示）**，选正确名称重试即可；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃） |
 | `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话 |
 | `unity_pool_state` | 查看/刷新本会话的 Unity 状态携带快照（v0.4.0）：立即采集一次并按开关返回各项状态（截图文件路径/选中项/序列化字段/Console）+ view.state（开关值与缓存摘要）；`refresh:false` 只读缓存 |
@@ -137,7 +141,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 166 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 186 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
@@ -157,3 +161,4 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 166 项：m
 - `0.4.0（注入治理）` **状态只在用户发消息时携带一次**：`unity-pool:state` context 改为**每回合只注入一次**——按会话**回合号去重**（`stateTurnOf` 从 `agent.session.events` 读最近 `turn/start`，agent-loop 每轮用户输入回合号 +1）：回合首个 request 注入最新快照，同回合后续工具循环 request 不再重复注入（避免一轮会话内同一状态块被反复塞进上下文 5~6 次）；下次发消息（回合号 +1）自动携带最新快照；无回合号（无法去重）保持原行为。客户端配套：轮询失败/非 ok **保留上次开关状态**（瞬时网络抖动不再把开关“关掉”）；头部「Unity」弹窗**打开时强制重拉**（与输入条开关实时同步，不再显示旧快照）。测试扩到 126 项全过。
 - `0.4.1` **工具列表随时可得 + 未知工具错误自描述 + 客户端两处开关同源**（源于「重命名健康度构成面板多文本组件」会话复盘：二次绑定拿不到列表 → Agent 盲猜 `read_editor_state` → Unknown tool 空转；用户实测头部面板与输入条 dock 两处开关不同步）：① `unity_pool_bind` **每次绑定都返回该服务最新 `tools`**（同服务重复绑定也重拉 tools/list 保持动态工具集合新鲜；拉取失败回退上次缓存并附 `toolsError`）；② `unity_pool_status`/view 新增**工具名速查 `tools: {serviceId, count, names}`**（未绑定为 null）；③ `unity_mcp` 收到 **Unknown tool 错误时自动附带当前可用工具名列表 + 相似工具名提示（Levenshtein）+ unity_pool_state 指引**；④ 系统提示指南/工具描述/README 同步（含「查编辑器状态用 unity_pool_state，不要猜 MCP 工具名」）；⑤ **客户端共享状态源**：头部「Unity」面板与输入条 dock 不再各自 useState + 各自轮询（面板不轮询、dock 5s 轮询 → 一边切换另一边最多延迟 5s、面板要重开才刷新），改为模块级 pub-sub store（按 sessionId 分槽，两处组件订阅同源）——任何一处切换成功立即写 store 广播、两处即时同步，5s 轮询仅作外部变化兜底，store 级 `switchSeq` 过期保护（仅用户切换递增；读取刷新互不干扰——避免「两组件轮询竞争使 dock 首次加载永远失败、开关条消失」的实测事故）防止在途旧快照覆盖新切换；⑥ **胶囊绑定态自动同步**：store 扩展存精简绑定信息（{serviceId, instanceId, instanceName, serviceName, alive}），胶囊 chip 的名字/颜色优先从 store 读；胶囊增加 5s 轻轮询（带 seq 过期保护）——agent 工具调用 bind/unbind、其它标签页的变化 ≤5s 自动反映，面板内点锁定/解绑即时更新；⑦ **面板锁定并行化**：「锁定」按钮普通绑定失败且错误含「已被会话锁定」时**自动以 force=true 重试一次**（并行开发是插件设计常态），成功即锁定、失败才提示「强制锁定失败」；⑧ **旧轮询快照不覆盖新切换**（修复「开关过一会自己关掉」）：`refresh`/`post` 响应里的 state 写入 store 前检查 `switchSeq`（请求发出期间若有用户切换则旧快照只更新 binding、不覆盖 state；`storeSet` 的 state/binding 参数支持 undefined=保留）。测试：host smoke **131 项全过** + client VM 冒烟扩到 **30 项全过**（`scripts/client-vm-smoke.mjs`：dock 切总开关 → 面板即时变、面板切子开关 → dock 芯片即时变、外部解绑 → 胶囊自动变回 Unity、外部绑定 → 胶囊自动恢复实例名、dock「未绑定 Unity」文本同步、面板点锁定/解绑 → 胶囊即时变、**并行锁定（被占用实例自动 force 重试）**、**旧轮询快照晚到不覆盖新切换**、sessionId 隔离）。
 - `0.4.2` **状态开关按会话独立 + 未绑定可切**（用户指出「开关全会话共享，却只有绑定会话能控制 → 不成交互闭环」）：① **开关 per-session**：`stateSwitchesBySession` 按 sessionId 持久化（`{ [sessionId]: {key: bool} }`，含"关"），生效值 = 配置默认 ← 旧全局层 ← 本会话覆盖；`stateCarryEnabled`/`collectState`/`stateContextText`/注入/`view.state` 全部按会话读开关——每个会话的「控制 → 采集 → 注入 → 感知」全链路闭环，互不干扰；`/api/state-switch` 的 sessionId 改为必填（缺省 400）；`/api/config` 返回全局默认层（配置 + 旧全局 base）；② **旧版全局平铺 `stateSwitches` 自动迁移**为全局默认层（base），未切换过的会话继承它，升级不丢设置；③ **未绑定 Unity 可切开关**（预配置）：dock 总开关/子项不再 `disabled:!bound`，未绑定灰显提示「未绑定 Unity，绑定后生效」，绑定后立即生效；子开关仍受总开关 gate（总关时禁用）；头部面板本来就可切，补文案「开关按会话记忆」；④ 诊断 `switchLog` 记录 sessionId。测试：host smoke 扩到 **166 项全过** + client VM 冒烟扩到 **31 项全过**（含 per-session 隔离、未绑定可切断言）。
+- `0.5.0` **原生工具注册（Claude 式工具清单）**（源于「将车身总拼岛迁移A岛界面任务」会话复盘：code 预设下模型只能经 `run_code` 调 `tools.*`，绑定脚本打印子集且字段取错 → 上下文没有工具清单 → 盲猜 `find_objects` → Unknown tool 空转；Claude 侧是 MCP `tools/list` 全量原生注入，天然有清单）：① 绑定成功后把该服务的 MCP 工具**动态注册为 DSH 原生工具 `umcp_<工具名>`**——模型上下文直接可见全部工具名/描述/参数并原生调用（`execute` 统一转发 `proxyMcp`，未绑定报错/实例激活/忙等待/未知工具提示全复用）；code 预设的 `tools:sdk` 声明 / native 预设的工具 schema 都会列出；② 配置 `nativeToolsEnabled`（默认开）/ `nativeToolSchema`（`compact` 默认：基础标量类型 + description、复杂/嵌套参数不展开省上下文；`full`：完整 inputSchema 逐级映射，与 Claude 注册 MCP 工具一致）；③ 注册键=服务（`syncNativeTools` 先注销旧注册再全量重注册），跨服务同名工具后绑定者接管，解绑不注销（其他会话可能用同一服务），`stop()` 全量注销（`tools.register` 返回的 disposer）；④ 工具集合动态变化（Unity 注册/注销、`manage_tools` 开关）在 bind / `unity_mcp` 重拉 `tools/list` 时同步刷新；⑤ `view.nativeTools` 按服务返回已注册摘要（count/names），view.rules 暴露开关与形态。测试：host smoke 扩到 **186 项全过**（新增 14 项：绑定注册/compact 标量保留+复杂不展开/full 完整 schema+顶层 required/未绑定报错/已绑定转发/HTTP nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/禁用不注册）。
