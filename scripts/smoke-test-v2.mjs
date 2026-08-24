@@ -15,6 +15,7 @@ function check(name, cond, detail) {
   if (cond) { console.log('  ✔ ' + name) }
   else { failures++; console.log('  ✘ ' + name + (detail ? '  → ' + String(detail).slice(0, 400) : '')) }
 }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 // ---------- mock mcp-for-unity server ----------
 function makeMcpServer(instances, opts = {}) {
@@ -540,17 +541,17 @@ check('v0.5.0：已绑定会话调 umcp_manage_scene 成功 active=ProjB', umcpR
   poolD.stop()
 }
 
-// ---------- v0.3.9 归档解绑动态通知（systemPrompt.context） ----------
-const archiveCtx = promptContexts.find(c => c.name === 'unity-pool:archive')
-check('apply：注册归档通知 context（text 为函数）', Boolean(archiveCtx) && typeof archiveCtx.text === 'function')
-check('通知 context：无归档记录时注入空串', archiveCtx.text({ agent: { id: 'sess-T', session: { id: 'sess-T' } } }) === '')
+// ---------- 归档语义（v0.5.1 设计修正）：实例掉线/域重载对已绑定会话无感，仅「会话归档」才解绑 ----------
+// 归档 = 会话被归档（DSH session/disposed）；实例掉线不做 probe 主动解绑、也不注入通知。
+// 这里用 apply 池验证：实例从列表消失 + 探测 → 绑定保持；调用时实例不可用 → 返回失败原因（不抛出）。
 {
   const res2 = fakeRes()
   await handler(fakeReq('GET', '/unity-pool/api/config'), res2)
   const pb2 = JSON.parse(res2._out.body)
-  check('HTTP /api/config 返回 notifyUnbindOnArchive', pb2.ok === true && pb2.value.notifyUnbindOnArchive === true)
+  check('HTTP /api/config 返回 callReconnectTimeoutMs', pb2.ok === true && typeof pb2.value.callReconnectTimeoutMs === 'number')
+  check('HTTP /api/config 不再暴露 notifyUnbindOnArchive（不注入通知）', pb2.ok === true && pb2.value.notifyUnbindOnArchive === undefined)
 }
-// 用 apply 池触发真实归档：sess-T 已绑定 ProjB（S1 → s1）；移除 ProjB 后 scan（内部 probe）→ 自动解绑
+// 实例掉线：移除 ProjB（模拟 Unity 域重载/关闭窗口）→ probe(scan) → 绑定保持（实例掉线对运行时会话无感）
 const idxProjB = s1.instancesRef.findIndex(i => i.id === 'ProjB@bbbb2222')
 if (idxProjB >= 0) s1.instancesRef.splice(idxProjB, 1)
 await registered.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { id: 'sess-T' } })
@@ -558,11 +559,9 @@ await registered.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { 
   const res3 = fakeRes()
   await handler(fakeReq('GET', '/unity-pool/api/status?sessionId=sess-T'), res3)
   const pb3 = JSON.parse(res3._out.body)
-  check('归档后（apply 池）：sess-T 已自动解绑', pb3.ok === true && pb3.value.binding === null, JSON.stringify(pb3.value.binding))
+  check('实例掉线 + 探测：绑定保持（probe 不主动解绑）', pb3.ok === true && pb3.value.binding && pb3.value.binding.instanceId === 'ProjB@bbbb2222', JSON.stringify(pb3.value.binding))
 }
-const notifT = archiveCtx.text({ agent: { id: 'sess-T', session: { id: 'sess-T' } } })
-check('通知 context：归档后向被解绑会话注入中文通知', notifT.includes('【Unity 服务池】') && notifT.includes('ProjB@bbbb2222') && notifT.includes('unity_pool_bind'), notifT.slice(0, 220))
-check('通知 context：其他会话注入空串', archiveCtx.text({ agent: { id: 'other-session', session: { id: 'other-session' } } }) === '')
+// （调用时实例离线 → 返回失败原因的覆盖见下面 poolR 场景——apply 池 activeInstance 已缓存且 mock 不模拟 WebSocket 断连，此处不重复验证）
 // 恢复 s1 实例数组（保持后续独立测试互不影响）
 if (idxProjB >= 0 && !s1.instancesRef.some(i => i.id === 'ProjB@bbbb2222')) s1.instancesRef.push({ id: 'ProjB@bbbb2222', name: 'ProjB', hash: 'bbbb2222' })
 
@@ -671,8 +670,9 @@ check('探测失败保守等待：总耗时 ≥ 1×interval', elapsed9 >= 30, 'e
 pool6.stop(); pool7.stop(); pool8.stop(); pool9.stop()
 s6.close(); s7.close(); s8.close(); s9.close()
 
-// ---------- v0.3.8 归档自动解绑 ----------
-// 场景1：实例从池中消失（Unity 关闭/下线）→ probe 后自动解绑该实例的会话
+// ---------- 归档语义（v0.5.1）：实例掉线/域重载对绑定会话无感，仅「会话归档」才解绑 ----------
+// 实例掉线/服务离线 → probe 不主动解绑（绑定保持）；真正的实例离线只在调用时由 proxyMcp
+// 自动重连并在超时后返回失败原因；唯一自动解绑入口 = 会话归档（session/disposed → _onSessionDisposed）。
 const instA = [
   { id: 'ProjK@kkkk1111', name: 'ProjK', hash: 'kkkk1111' },
   { id: 'ProjL@llll2222', name: 'ProjL', hash: 'llll2222' },
@@ -683,44 +683,40 @@ const poolA = createPool(ctx, {
   services: [{ id: 'SA', name: '服务A', url: 'http://127.0.0.1:' + sA.port() + '/mcp' }],
   dataFile: dataFile + '.sA',
   probeIntervalMs: 5000,
-  unbindOfflineStreak: 2,
 })
 await poolA.probe()
 await poolA.bind('sess-K', { instance: 'ProjK@kkkk1111' })
 await poolA.bind('sess-L', { instance: 'ProjL@llll2222' })
-check('归档前：sess-K 绑定 ProjK', poolA.bindingOf('sess-K')?.instanceId === 'ProjK@kkkk1111')
-check('归档前：sess-L 绑定 ProjL', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
-instA.splice(0, 1) // ProjK 消失（Unity 关闭）
+check('绑定：sess-K → ProjK、sess-L → ProjL', poolA.bindingOf('sess-K')?.instanceId === 'ProjK@kkkk1111' && poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
+// 实例掉线：移除 ProjK → probe → 不解绑（实例掉线对运行时会话无感）
+instA.splice(0, 1)
 await poolA.probe()
-check('实例归档后：sess-K 被自动解绑', poolA.bindingOf('sess-K') === null, JSON.stringify(poolA.bindingOf('sess-K')))
-check('实例归档后：sess-L 保持绑定', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
-check('实例归档后：lastAutoUnbind 记录 instance-archived', poolA.lastAutoUnbind && poolA.lastAutoUnbind.items.some(i => i.sessionId === 'sess-K' && i.reason === 'instance-archived'), JSON.stringify(poolA.lastAutoUnbind))
-const viewK = poolA.view('sess-K')
-check('view：解绑后 binding 为 null', viewK.binding === null)
-check('view：SA instancesValid=true 且仅剩 ProjL', viewK.services[0].instancesValid === true && viewK.services[0].instances.length === 1 && viewK.services[0].instances[0].id === 'ProjL@llll2222')
-check('view：rules 含 autoUnbindOnArchive/unbindOfflineStreak', viewK.rules.autoUnbindOnArchive === true && viewK.rules.unbindOfflineStreak === 2)
-check('HTTP /api/config 返回 autoUnbindOnArchive', typeof poolA.cfg.autoUnbindOnArchive === 'boolean' && poolA.cfg.unbindOfflineStreak === 2)
-
-// 场景2：实例发现失败（instancesValid=false）→ 保留旧列表、不解绑（发现失败≠实例消失）
+check('实例掉线 + 探测：sess-K 保持绑定（不主动解绑）', poolA.bindingOf('sess-K')?.instanceId === 'ProjK@kkkk1111', JSON.stringify(poolA.bindingOf('sess-K')))
+check('实例掉线：view 显示实例消失（列表仅剩 ProjL）', poolA.view('sess-K').services[0].instances.length === 1 && poolA.view('sess-K').services[0].instances[0].id === 'ProjL@llll2222')
+// 再移除 ProjL → probe → 仍不解绑
+instA.splice(0, 1)
+await poolA.probe()
+check('实例全部掉线 + 探测：sess-L 仍绑定（不主动解绑）', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222', JSON.stringify(poolA.bindingOf('sess-L')))
+// 服务离线 → probe → 仍不解绑（服务离线对已绑定会话无感）
+sA.setOffline(true)
+await poolA.probe()
+check('服务离线 + 探测：sess-L 仍绑定（不主动解绑）', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222', JSON.stringify(poolA.bindingOf('sess-L')))
+sA.setOffline(false)
+// 发现失败（instancesValid=false）：保留上次列表，仍不解绑
 sA.setFailInstances(true)
 await poolA.probe()
 check('发现失败：instancesValid=false', poolA.serviceById('SA').instancesValid === false)
-check('发现失败：保留上次列表（ProjL 仍在）', poolA.serviceById('SA').instances.some(i => i.id === 'ProjL@llll2222'))
-check('发现失败：不解绑 sess-L', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
+check('发现失败：不误解绑', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
 sA.setFailInstances(false)
-
-// 场景3：服务离线——连续离线达到 unbindOfflineStreak(2) 才解绑（防瞬时抖动）
-sA.setOffline(true)
-await poolA.probe() // 第 1 次离线：streak=1，未达阈值
-check('服务离线 1 次：不解绑（防抖动）', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222', JSON.stringify(poolA.bindingOf('sess-L')))
-check('服务离线 1 次：offlineStreak=1', poolA.serviceById('SA').offlineStreak === 1)
-await poolA.probe() // 第 2 次离线：streak=2，达阈值 → 解绑
-check('服务离线 2 次：sess-L 被自动解绑', poolA.bindingOf('sess-L') === null)
-check('服务离线 2 次：lastAutoUnbind 记录 service-offline', poolA.lastAutoUnbind && poolA.lastAutoUnbind.items.some(i => i.sessionId === 'sess-L' && i.reason === 'service-offline'), JSON.stringify(poolA.lastAutoUnbind))
-sA.setOffline(false)
+// 会话归档（session/disposed）→ 自动解绑该会话锁定的实例（唯一自动解绑入口）
+poolA._onSessionDisposed({ id: 'sess-K' })
+check('会话归档：sess-K 被自动解绑', poolA.bindingOf('sess-K') === null, JSON.stringify(poolA.bindingOf('sess-K')))
+check('会话归档：sess-L 不受影响', poolA.bindingOf('sess-L')?.instanceId === 'ProjL@llll2222')
+check('view.rules 反映 autoUnbindOnArchive + callReconnectTimeoutMs', (() => { const rv = poolA.view('sess-L').rules; return rv.autoUnbindOnArchive === true && typeof rv.callReconnectTimeoutMs === 'number' })())
 poolA.stop()
+sA.close()
 
-// 场景4：autoUnbindOnArchive=false → 不解绑
+// autoUnbindOnArchive=false：会话归档不解绑
 const instB = [{ id: 'ProjM@mmmm3333', name: 'ProjM', hash: 'mmmm3333' }]
 const sB = makeMcpServer(instB)
 await sB.listen()
@@ -729,70 +725,50 @@ const poolB = createPool(ctx, {
   dataFile: dataFile + '.sB',
   probeIntervalMs: 5000,
   autoUnbindOnArchive: false,
-  unbindOfflineStreak: 1,
 })
 await poolB.probe()
 await poolB.bind('sess-M', { instance: 'ProjM@mmmm3333' })
-instB.splice(0, 1) // 实例消失
-await poolB.probe()
-check('autoUnbindOnArchive=false：实例消失不解绑', poolB.bindingOf('sess-M')?.instanceId === 'ProjM@mmmm3333', JSON.stringify(poolB.bindingOf('sess-M')))
+poolB._onSessionDisposed({ id: 'sess-M' })
+check('autoUnbindOnArchive=false：会话归档不解绑', poolB.bindingOf('sess-M')?.instanceId === 'ProjM@mmmm3333', JSON.stringify(poolB.bindingOf('sess-M')))
 check('autoUnbindOnArchive=false：view.rules 反映 false', poolB.view('sess-M').rules.autoUnbindOnArchive === false)
 poolB.stop()
 sB.close()
 
-// 场景5：服务从未在线过（aliveAt=0）→ 服务离线不因启动抖动解绑
-const instC = [{ id: 'ProjN@nnnn4444', name: 'ProjN', hash: 'nnnn4444' }]
-const sC = makeMcpServer(instC)
-await sC.listen()
-const poolC = createPool(ctx, {
-  services: [{ id: 'SC', name: '服务C', url: 'http://127.0.0.1:' + sC.port() + '/mcp' }],
-  dataFile: dataFile + '.sC',
+// 调用时实例离线：返回失败原因（不抛出），重连后调用成功（无感）
+const instR = [{ id: 'ProjX@xxxx7777', name: 'ProjX', hash: 'xxxx7777' }]
+const sR = makeMcpServer(instR)
+await sR.listen()
+const poolR = createPool(ctx, {
+  services: [{ id: 'SR', name: '服务R', url: 'http://127.0.0.1:' + sR.port() + '/mcp' }],
+  dataFile: dataFile + '.sR',
   probeIntervalMs: 5000,
-  unbindOfflineStreak: 1,
+  callReconnectTimeoutMs: 2000, // 缩短真实等待
 })
-await poolC.probe()
-await poolC.bind('sess-N', { instance: 'ProjN@nnnn4444' })
-// 直接离线（从未离线过 → aliveAt>0，但本次是第一次离线 streak=1 达阈值）
-// 先造一次"从未在线"：手动把 aliveAt 归零模拟
-poolC.serviceById('SC').aliveAt = 0
-sC.setOffline(true)
-await poolC.probe()
-check('服务从未在线过且离线：不解绑（避免启动抖动误伤）', poolC.bindingOf('sess-N')?.instanceId === 'ProjN@nnnn4444', JSON.stringify(poolC.bindingOf('sess-N')))
-sC.setOffline(false)
-poolC.stop()
-sC.close()
+await poolR.probe()
+await poolR.bind('sess-X', { instance: 'ProjX@xxxx7777' })
+check('绑定：sess-X → ProjX', poolR.bindingOf('sess-X')?.instanceId === 'ProjX@xxxx7777')
+// 实例掉线 → 调用返回失败原因（不抛出）
+instR.splice(0, 1)
+let threwR = null
+let rOut = null
+try { rOut = await poolR.proxyMcp('sess-X', 'manage_scene', { action: 'get_hierarchy' }) } catch (e) { threwR = e.message }
+check('调用时实例离线：返回失败原因（不抛出）', threwR === null && rOut && rOut.success === false && /实例不可用|重连超时|离线/.test(rOut.text || ''), JSON.stringify({ threwR, text: rOut && rOut.text }).slice(0, 300))
+// 实例重连（恢复列表）+ 探测 → 再次调用成功（实例掉线对运行时会话无感）
+instR.push({ id: 'ProjX@xxxx7777', name: 'ProjX', hash: 'xxxx7777' })
+await poolR.probe()
+const rOut2 = await poolR.proxyMcp('sess-X', 'manage_scene', { action: 'get_hierarchy' })
+check('实例重连后调用成功（无感）', rOut2 && rOut2.success === true && rOut2.activeInstance === 'ProjX@xxxx7777', JSON.stringify(rOut2).slice(0, 200))
+// view.rules 反映 callReconnectTimeoutMs
+check('view.rules 反映 callReconnectTimeoutMs', (() => { const rv = poolR.view('sess-X').rules; return rv.callReconnectTimeoutMs === 2000 })())
+poolR.stop()
+sR.close()
 
-// 场景6：service-removed（服务配置不存在）→ 自动解绑
-const instD = [{ id: 'ProjO@oooo5555', name: 'ProjO', hash: 'oooo5555' }]
-const sD = makeMcpServer(instD)
-await sD.listen()
-const poolD = createPool(ctx, {
-  services: [{ id: 'SD', name: '服务D', url: 'http://127.0.0.1:' + sD.port() + '/mcp' }],
-  dataFile: dataFile + '.sD',
-  probeIntervalMs: 5000,
-  unbindOfflineStreak: 1,
-})
-await poolD.probe()
-await poolD.bind('sess-O', { instance: 'ProjO@oooo5555' })
-poolD.services = poolD.services.filter(s => s.id !== 'SD') // 配置移除
-await poolD.probe()
-check('service-removed：绑定被自动解绑', poolD.bindingOf('sess-O') === null)
-check('service-removed：lastAutoUnbind 记录', poolD.lastAutoUnbind && poolD.lastAutoUnbind.items.some(i => i.sessionId === 'sess-O' && i.reason === 'service-removed'), JSON.stringify(poolD.lastAutoUnbind))
-poolD.stop()
-sD.close()
-
-// 场景7：自动解绑持久化——重建池后不残留已归档绑定
+// 供后续状态携带默认值检查使用的默认池
 const poolA2 = createPool(ctx, {
-  services: [{ id: 'SA', name: '服务A', url: 'http://127.0.0.1:' + sA.port() + '/mcp' }],
-  dataFile: dataFile + '.sA',
+  services: [{ id: 'SA', name: '服务A', url: 'http://127.0.0.1:9/mcp' }],
+  dataFile: dataFile + '.sA2',
   probeIntervalMs: 5000,
 })
-await poolA2.probe()
-check('持久化：重建后 sess-K/sess-L 均未残留', poolA2.bindingOf('sess-K') === null && poolA2.bindingOf('sess-L') === null)
-poolA2.stop()
-sA.close()
-
-// ---------- v0.4.0 状态携带 ----------
 // 默认全关：不显式传 state* → enabled=false，stateCarryEnabled=false，context 注入空串
 check('状态携带：默认 stateEnabled=false', poolA2.cfg.stateEnabled === false)
 check('状态携带：默认所有子开关 false', ['stateGameScreenshot','stateSceneScreenshot','stateSelection','stateUiSnapshot','stateSerialized','stateConsoleAll','stateConsoleSelected'].every(k => poolA2.cfg[k] === false), JSON.stringify(poolA2.cfg))

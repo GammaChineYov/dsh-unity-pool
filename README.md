@@ -30,9 +30,9 @@ MCP 会话（Session）＝ 每 DSH 会话 × 服务 一个独立 Mcp-Session-Id�
 5. 另一个会话锁 A 并行工作：per MCP-Session-Id 隔离，两会话各自 target 各自实例，互不干扰；
 6. 用完 `unity_pool_unbind` 释放。
 
-> 归档自动解绑 + 通知：实例被归档（Unity 关闭/下线/服务离线）时插件自动解绑该实例的会话，
-> 并在下一轮请求向被解绑会话注入一段中文通知（时间/实例/原因 + 重新 bind 指引，官方
-> `systemPrompt.context` 机制，仅该会话可见），agent 无需主动碰工具就能感知绑定已失效。
+> 归档语义（v0.5.1 设计修正）：归档 = 本 DSH 会话被归档（session/disposed）→ 插件自动解绑该会话锁定的实例。
+> 实例掉线/域重载对已绑定会话是无感的——绑定保持、不做 probe 主动解绑、也不注入通知；真正的实例离线只在
+> 「调用时」由 unity_mcp/umcp_* 自动重连并在超时（callReconnectTimeoutMs，默认 20s）后才返回失败原因。
 
 > 关于「切换/排队」：官方 HTTP 模式 active 实例按 session 隔离（见 `test_multi_user_session_isolation.py`），
 > 所以不需要「服务级全局切换 + 互斥等待」。同一实例被多会话并发调用时由 Unity 侧单线程排队（官方文档所述，性能排队而非错误）。
@@ -86,9 +86,8 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     busyWaitEnabled: true     # unity_mcp 调用前探测 Unity 忙状态（编译/刷新/进度条）并自动等待
     busyMaxWaitMs: 10000      # 忙时等待总时长上限（ms），默认 10 秒
     busyWaitIntervalMs: 500   # 忙时等待的探测间隔（ms）
-    autoUnbindOnArchive: true # 实例被归档（从池中消失/服务离线）时自动解绑绑定该实例的会话
-    unbindOfflineStreak: 2    # 服务离线连续探测次数达到该值才视为归档并自动解绑（防瞬时抖动）
-    notifyUnbindOnArchive: true # 归档自动解绑后，向被解绑的会话注入运行时通知（systemPrompt.context，下一轮 request 自动感知）
+    autoUnbindOnArchive: true # 会话归档（DSH session/disposed）时自动解绑该会话锁定的实例；实例掉线/域重载对绑定会话无感（不主动解绑、不注入通知）
+    callReconnectTimeoutMs: 20000 # 调用时实例离线的重连/等待时长（ms，默认 20s）：unity_mcp/umcp_* 路由到实例时给足超时让官方服务端的会话重连等待完成，超过才判定实例离线并返回失败原因
     # ---- 原生工具注册（v0.5.0，Claude 式工具清单）----
     nativeToolsEnabled: true   # 绑定成功后把该服务的 MCP 工具动态注册为原生工具（umcp_<工具名>），模型上下文直接可见可调
     nativeToolSchema: compact  # 参数 schema 形态：compact=基础标量类型+description、复杂参数不展开（省上下文，默认）；full=完整 inputSchema（与 Claude 注册 MCP 工具一致，参数校验最全但上下文开销大）
@@ -146,6 +145,7 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 186 项：m
 
 ## 变更日志
 
+- `0.5.1` **归档语义修正（修复「进 Play 域重载被 autoUnbindOnArchive 解绑」）**：归档的定义改为「本 DSH 会话被归档（session/disposed）」→ 自动解绑该会话锁定的实例，而不是「实例被归档」。实例掉线/域重载对已绑定会话是无感的——绑定保持、不做 probe 主动解绑、也不注入通知（移除 notifyUnbindOnArchive / unbindOfflineStreak / unbindArchiveGraceMs）。真正的实例离线只在调用时处理：unity_mcp/umcp_* 路由到实例时给足超时（新增 `callReconnectTimeoutMs`，默认 20s）让官方 mcp-for-unity 服务端的会话重连等待（默认 20s）完成，超过才判定实例离线并返回失败原因（不再抛出）。订阅 `session/disposed` 作为唯一自动解绑入口（autoUnbindOnArchive 默认开启）。smoke 重构归档场景，181 项全过。
 - `0.1.0` v1：会话→服务绑定 + 探活 + 面板；
 - `0.2.0` v2：实例级——实例发现、会话目标实例锁定、`unity_mcp` 代理（per MCP-Session-Id 隔离）、`unity_pool_scan`；
 - `0.3.0` v3：客户端**全行内样式**（不再注入全局 `<style>`，避免影响其它客户端插件样式；弹窗改为贴近按钮、无遮罩、toggle 开关）。
