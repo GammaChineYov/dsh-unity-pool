@@ -81,7 +81,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     probeTimeoutMs: 3000      # 单次 MCP 请求超时（ms）
     scanPorts: [8080, 8081, 8082, 8083, 8084, 8090]   # unity_pool_scan 自动扫描的端口段
     autoAssign: true          # 未指定实例时自动分配未被其他会话锁定的实例
-    enforceExclusive: true    # 同一实例默认不能被第二个会话锁定
+    enforceExclusive: true    # 仅在显式传 force=false 时生效（并行开发是正常用法，force 默认 true，默认不拒绝并行绑定）
     connectHint: '调用 unity_mcp(tool=..., params=...) 代理 MCP 工具调用'
     busyWaitEnabled: true     # unity_mcp 调用前探测 Unity 忙状态（编译/刷新/进度条）并自动等待
     busyMaxWaitMs: 10000      # 忙时等待总时长上限（ms），默认 10 秒

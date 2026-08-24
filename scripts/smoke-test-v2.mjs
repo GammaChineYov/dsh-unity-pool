@@ -229,8 +229,9 @@ check('sess-Z 自动分配 → ProjC', bZ.instanceId === 'ProjC@cccc3333', JSON.
 check('sess-Z 首次绑定返回工具列表（S2 服务）', Array.isArray(bZ.tools) && bZ.toolsCount === 4, JSON.stringify(bZ.tools).slice(0, 200))
 
 let conflict = null
-try { await pool.bind('sess-W', { instance: 'ProjA@aaaa1111' }) } catch (e) { conflict = e.message }
-check('排他：sess-W 锁 ProjA 被拒', /锁定/.test(conflict || ''), conflict)
+// force 默认 true（并行是正常用法）；显式 force=false 且 enforceExclusive=true 时才拒绝并行
+try { await pool.bind('sess-W', { instance: 'ProjA@aaaa1111', force: false }) } catch (e) { conflict = e.message }
+check('排他：force=false 时并行绑定被拒（enforceExclusive）', /并行使用|force=true/.test(conflict || ''), conflict)
 
 const vX = pool.view('sess-X')
 const s1v = vX.services.find(s => s.id === 'S1')
