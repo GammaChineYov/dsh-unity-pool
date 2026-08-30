@@ -145,6 +145,7 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 186 项：m
 
 ## 变更日志
 
+- `0.5.1` **dock 对齐输入框修复**：输入框上方两条 dock（`⚡ 转译` 与 Unity 状态携带开关条）此前未套 `--dsh-composer-*` 共享几何（`width: calc(100% - 2×side-clearance - 4×dock-inset)` + `margin: 0 auto` + `max-width`），撑满整列导致与居中输入卡片错位、两条 dock 彼此也未对齐。`lib/client.js` 的 `dockWrap` 行内样式与 `.prep-dock` CSS 补上同一套居中限宽几何（复用 `var(--dsh-composer-side-clearance)` / `var(--dsh-composer-dock-inset)` / `var(--dsh-composer-card-max-width)`），与官方 todo/goal/queue dock 卡片同宽居中；client 刷新页面即生效。
 - `0.5.1` **归档语义修正（修复「进 Play 域重载被 autoUnbindOnArchive 解绑」）**：归档的定义改为「本 DSH 会话被归档（session/disposed）」→ 自动解绑该会话锁定的实例，而不是「实例被归档」。实例掉线/域重载对已绑定会话是无感的——绑定保持、不做 probe 主动解绑、也不注入通知（移除 notifyUnbindOnArchive / unbindOfflineStreak / unbindArchiveGraceMs）。真正的实例离线只在调用时处理：unity_mcp/umcp_* 路由到实例时给足超时（新增 `callReconnectTimeoutMs`，默认 20s）让官方 mcp-for-unity 服务端的会话重连等待（默认 20s）完成，超过才判定实例离线并返回失败原因（不再抛出）。订阅 `session/disposed` 作为唯一自动解绑入口（autoUnbindOnArchive 默认开启）。smoke 重构归档场景，181 项全过。
 - `0.1.0` v1：会话→服务绑定 + 探活 + 面板；
 - `0.2.0` v2：实例级——实例发现、会话目标实例锁定、`unity_mcp` 代理（per MCP-Session-Id 隔离）、`unity_pool_scan`；
