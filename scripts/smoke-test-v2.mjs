@@ -40,6 +40,13 @@ function makeMcpServer(instances, opts = {}) {
   let failToolsListFlag = opts.failToolsList === true // setFailToolsList(v)：运行时切换 tools/list 失败
   // 选中项返回（真实场景：场景内 GameObject 的 InstanceID 为负数——插件解析必须支持负号）
   let selectionResult = 'count=1\n- Cube | type=GameObject | id=-101 | path=Root/Cube' // setSelectionResult(v)：切换选中项
+  // v0.5.2 错误日志携带：opts.consoleCounts=true 时探测响应带 Console 计数（e/w/n），read_console(types:['error']) 回放错误日志
+  const consoleCounts = opts.consoleCounts === true
+  let errorLog = Array.isArray(opts.errorLog) ? [...opts.errorLog] : []
+  let errorOnRead = null // setErrorOnRead(msg)：模拟「读明细期间 Console 又冒出新错误」的竞态（只生效一次）
+  // v0.5.4 工具排序：opts.customTools = 本工程自定义工具名（官方 mcpforunity://custom-tools 资源）；
+  // 不传 = 老服务端没有该资源（resources/read 报错）→ 插件退化为服务端原序
+  const customToolNames = Array.isArray(opts.customTools) ? opts.customTools : null
   let snapshotFile = null // setSnapshotFile(v)：ui_snapshot 返回 absolutePath → 走快照地图模式
   const server = http.createServer(async (req, res) => {
     if (offlineFlag) {
@@ -91,6 +98,22 @@ function makeMcpServer(instances, opts = {}) {
       result = {
         contents: [{ type: 'text', text: JSON.stringify({ success: true, transport: 'http', instance_count: instances.length, instances }) }],
       }
+    } else if (method === 'resources/read' && msg.params && msg.params.uri === 'mcpforunity://custom-tools') {
+      // v0.5.4：工程自定义工具注册表（按当前激活实例）；老服务端没有该资源 → 报错
+      if (!customToolNames) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Unknown resource: mcpforunity://custom-tools' } }))
+        return
+      }
+      // 与真实服务端一致：该资源列出「本实例注册的全部工具」，官方内置也包含在内；插件需剔除官方名
+      const official = ['execute_code', 'manage_scene', 'read_console', 'manage_gameobject']
+      const all = official.concat(customToolNames)
+      result = {
+        contents: [{ type: 'text', text: JSON.stringify({
+          success: true, message: 'Custom tools retrieved successfully.', error: null,
+          data: { project_id: 'proj', tool_count: all.length, tools: all.map(n => ({ name: n, description: n })) },
+        }) }],
+      }
     } else if (method === 'resources/read' && msg.params && /^mcpforunity:\/\/scene\/gameobject\/-?\d+\/components$/.test(msg.params.uri)) {
       // 选中物体序列化字段（v0.4.0 状态携带）；场景 GameObject 的 InstanceID 为负数
       result = {
@@ -131,9 +154,18 @@ function makeMcpServer(instances, opts = {}) {
           if (b === 'error') {
             result = { isError: true, content: [{ type: 'text', text: 'execute_code boom' }] }
           } else {
-            result = { content: [{ type: 'text', text: b ? 'c=1;u=1;p=2' : 'c=0;u=0;p=0' }] }
+            const base = b ? 'c=1;u=1;p=2' : 'c=0;u=0;p=0'
+            // consoleCounts=false 保持老响应（不带计数）→ 插件按 -1 降级，只跟踪编译跃迁
+            const tail = consoleCounts ? ';e=' + errorLog.length + ';w=0;n=0' : ''
+            result = { content: [{ type: 'text', text: base + tail }] }
           }
         }
+      } else if (st.active && !instances.some(i => i.id === st.active)) {
+        // 目标实例已掉线（从实例列表消失）：官方服务端此时无法路由 → JSON-RPC 错误
+        // （插件 proxyMcp 捕获后返回「调用失败（实例离线/重连超时）」失败原因，不抛出）
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'instance offline: ' + st.active } }))
+        return
       } else {
         calls.push({ sessionId: sid, active: st.active, tool: name, args })
         if (!st.active) {
@@ -146,6 +178,18 @@ function makeMcpServer(instances, opts = {}) {
           if (snapshotFile) summary.absolutePath = snapshotFile // 地图模式：指向可解析的 Library JSON
           result = {
             content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'UI snapshot - 6 nodes, 2 refs', error: null, data: { summary, roots: [{ instanceID: 101 }], text: '# UI Snapshot: 6 nodes, 2 refs, 2 backrefs\r\nRoots: [101]\r\nTree:\r\n- [101] Cube (Transform,BoxCollider) R:2 B:2 (inactive) rect:[0,0,10,10]\r\n  - [102] Template (Image,ScrollRect) R:2 B:1 (inactive) rect:[0,0,0,0]\r\n    - [104] Viewport (Image,Mask) R:1 B:1 (inactive) rect:[0,0,0,0]\r\n      - [105] Content R:0 B:1 (inactive) rect:[0,0,0,0]\r\n  - [106] Template (Image,ScrollRect) R:2 B:1 (inactive) rect:[0,0,0,0]\r\n    - [107] Viewport (Image,Mask) R:1 B:1 (inactive) rect:[0,0,0,0]\r\n      - [108] Content R:0 B:1 (inactive) rect:[0,0,0,0]\r\n  - [110] label_0_0 R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [111] Icon (Image) R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [112] Text (Text) R:1 B:0 (inactive) rect:[0,0,0,0]\r\n  - [113] label_0_1 R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [114] Icon (Image) R:0 B:0 (inactive) rect:[0,0,0,0]\r\n    - [115] Text (Text) R:1 B:0 (inactive) rect:[0,0,0,0]\r\nRefs (outgoing):\r\n[101] Cube.Comp.fieldA -> [103] TargetA (Material)\r\n[101] Cube.Comp.fieldB -> [109] TargetB\r\n[101] Cube.Comp.fieldC -> [111] TargetC\r\n[101] Cube.Comp.fieldC -> [111] TargetC\r\nBackrefs (incoming, 快照内):\r\n[102] <- [101] Cube.Comp.fieldA\r\n[102] <- [104] Viewport.Image.m_Sprite' } }) }],
+          }
+        } else if (name === 'read_console' && args.action === 'get' && Array.isArray(args.types) && args.types.includes('error')) {
+          // v0.5.2 错误日志携带：只回错误条目（最新 count 条，官方语义）
+          if (errorOnRead) { errorLog.push(errorOnRead); errorOnRead = null } // 竞态：读之前又新增一条
+          const n = Math.max(0, Number(args.count) || 0)
+          const picked = n > 0 ? errorLog.slice(-n) : []
+          // 官方语义：format=detailed 回结构化条目（含 file/line/stackTrace），plain 回纯文案数组
+          const data = args.format === 'detailed'
+            ? picked.map(m => ({ type: 'Error', message: m, file: 'Assets/Mock.cs', line: 42, stackTrace: 'MockClass:Method ()\nUnityEngine.Debug:LogError (object)' }))
+            : picked
+          result = {
+            content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Retrieved ' + picked.length + ' log entries.', data }) }],
           }
         } else if (name === 'read_console' && args.action === 'get') {
           // v0.4.0 状态携带：Console 全文
@@ -180,6 +224,11 @@ function makeMcpServer(instances, opts = {}) {
     setFailInstances(v) { failInstancesFlag = v },
     setFailToolsList(v) { failToolsListFlag = v },
     setSelectionResult(v) { selectionResult = v },
+    addErrors(...msgs) { for (const m of msgs) errorLog.push(String(m)) },
+    clearErrors() { errorLog = [] },
+    setErrorOnRead(msg) { errorOnRead = msg === undefined ? null : String(msg) },
+    errorCount: () => errorLog.length,
+    pushBusy(...pattern) { for (const b of pattern) busyPattern.push(b) },
     setSnapshotFile(v) { snapshotFile = v },
     instancesRef: instances,
     listen: () => new Promise(r => server.listen(0, '127.0.0.1', r)), port: () => server.address().port, close: () => server.close(),
@@ -604,6 +653,7 @@ const pool6 = createPool(ctx, {
   services: [{ id: 'S6', name: '服务6', url: 'http://127.0.0.1:' + s6.port() + '/mcp' }],
   dataFile: dataFile + '.s6',
   probeIntervalMs: 5000,
+  errorWatchEnabled: false, // 本组只测忙等待语义（v0.5.2 错误携带会额外加一次「调用后」探测）
   busyWaitEnabled: true,
   busyMaxWaitMs: 2000,
   busyWaitIntervalMs: 50,
@@ -625,6 +675,7 @@ const pool7 = createPool(ctx, {
   services: [{ id: 'S7', name: '服务7', url: 'http://127.0.0.1:' + s7.port() + '/mcp' }],
   dataFile: dataFile + '.s7',
   probeIntervalMs: 5000,
+  errorWatchEnabled: false,
   busyWaitIntervalMs: 20,
 })
 await pool7.probe()
@@ -639,6 +690,7 @@ const pool8 = createPool(ctx, {
   services: [{ id: 'S8', name: '服务8', url: 'http://127.0.0.1:' + s8.port() + '/mcp' }],
   dataFile: dataFile + '.s8',
   probeIntervalMs: 5000,
+  errorWatchEnabled: false,
   busyWaitEnabled: false,
 })
 await pool8.probe()
@@ -655,6 +707,7 @@ const pool9 = createPool(ctx, {
   services: [{ id: 'S9', name: '服务9', url: 'http://127.0.0.1:' + s9.port() + '/mcp' }],
   dataFile: dataFile + '.s9',
   probeIntervalMs: 5000,
+  errorWatchEnabled: false,
   busyWaitEnabled: true,
   busyMaxWaitMs: 2000,
   busyWaitIntervalMs: 50,
@@ -670,6 +723,227 @@ check('探测失败保守等待：总耗时 ≥ 1×interval', elapsed9 >= 30, 'e
 
 pool6.stop(); pool7.stop(); pool8.stop(); pool9.stop()
 s6.close(); s7.close(); s8.close(); s9.close()
+
+// ---------- v0.5.2 错误日志携带（调用前后各检查一次 → 新增错误随本次结果返回一次） ----------
+const sE = makeMcpServer([{ id: 'ProjE1@eeee1111', name: 'ProjE1', hash: 'eeee1111' }], { consoleCounts: true, errorLog: ['历史错误 A', '历史错误 B'] })
+await sE.listen()
+const poolE = createPool(ctx, {
+  services: [{ id: 'SE', name: '服务E', url: 'http://127.0.0.1:' + sE.port() + '/mcp' }],
+  dataFile: dataFile + '.sE',
+  probeIntervalMs: 5000,
+  busyMaxWaitMs: 500,
+  busyWaitIntervalMs: 20,
+})
+await poolE.probe()
+await poolE.bind('sess-E1')
+const callE = () => poolE.proxyMcp('sess-E1', 'manage_scene', { action: 'get_hierarchy' })
+
+const e1 = await callE()
+check('错误携带：首次调用只建立基线（历史错误不回溯）', e1.success === true && e1.errorWatch === undefined, JSON.stringify(e1).slice(0, 200))
+
+sE.addErrors('Assets/A.cs(12,34): error CS0246: 找不到类型 Foo', '运行时错误 1', '运行时错误 2')
+const e2 = await callE()
+check('错误携带：新增 3 条 → 本次调用带回明细', e2.errorWatch && e2.errorWatch.newErrorCount === 3 && e2.errorWatch.shown === 3, JSON.stringify(e2.errorWatch))
+check('错误携带：明细同时进 text（模型直接可见）', /新增错误日志 3 条/.test(e2.text || '') && /error CS0246/.test(e2.text || ''), String(e2.text).slice(0, 300))
+check('错误携带：编译错误特征被识别', e2.errorWatch.compileErrors === true, JSON.stringify(e2.errorWatch))
+check('错误携带：明细带类型/文件行/堆栈（read_console format=detailed）', /^\[Error\] /.test(e2.errorWatch.entries[0]) && /\(at Assets\/Mock\.cs:42\)/.test(e2.errorWatch.entries[0]) && /MockClass:Method/.test(e2.errorWatch.entries[0]), String(e2.errorWatch.entries[0]).slice(0, 200))
+check('错误携带：调用后探测状态回传 editorStateAfter', /^isCompiling=0,isUpdating=0,progressCount=0,consoleErrors=5$/.test(e2.editorStateAfter || ''), e2.editorStateAfter)
+
+const e3 = await callE()
+check('错误携带：同一批只在一次工具调用返回（游标推进）', e3.errorWatch === undefined, JSON.stringify(e3).slice(0, 200))
+
+sE.addErrors(...Array.from({ length: 8 }, (_, i) => '批量错误 ' + (i + 1)))
+const e4 = await callE()
+check('错误携带：新增 8 条只显示前 5 条', e4.errorWatch && e4.errorWatch.newErrorCount === 8 && e4.errorWatch.shown === 5 && e4.errorWatch.entries[0].includes('批量错误 1'), JSON.stringify(e4.errorWatch).slice(0, 300))
+check('错误携带：其余条数在文案里交代', /另有 3 条新增错误/.test(e4.text || ''), String(e4.text).slice(0, 300))
+
+sE.addErrors('X'.repeat(2500))
+const e5 = await callE()
+check('错误携带：单条超 2000 字符截断并标注', e5.errorWatch.entries[0].length < 2200 && /已截断 \d+ 字符，仅显示前 2000 字符/.test(e5.errorWatch.entries[0]), String(e5.errorWatch.entries[0]).slice(-120))
+
+sE.clearErrors()
+const e6 = await callE()
+check('错误携带：Console 被 Clear（计数回落）不误报', e6.errorWatch === undefined, JSON.stringify(e6).slice(0, 200))
+sE.addErrors('清空后的新错误')
+const e6b = await callE()
+check('错误携带：Clear 后的新错误照常上报', e6b.errorWatch && e6b.errorWatch.newErrorCount === 1 && /清空后的新错误/.test(e6b.text || ''), JSON.stringify(e6b.errorWatch))
+
+sE.pushBusy(true, false) // 调用前探测=编译中 → 等待 → 空闲：一次编译跃迁
+const e7 = await callE()
+check('错误携带：编译完成且无新增错误 → 回一行「编译完成」', e7.errorWatch && e7.errorWatch.compileDetected === true && e7.errorWatch.newErrorCount === 0 && /编译完成/.test(e7.text || ''), JSON.stringify(e7.errorWatch))
+
+sE.pushBusy(true, false)
+sE.addErrors('Assets/B.cs(3,5): error CS1002: 应输入 ;')
+const e8 = await callE()
+check('错误携带：编译 + 编译错误 → compileDetected + compileErrors', e8.errorWatch && e8.errorWatch.compileDetected === true && e8.errorWatch.compileErrors === true && /发生了编译，含编译错误/.test(e8.text || ''), JSON.stringify(e8.errorWatch))
+
+const vE = poolE.view('sess-E1')
+check('错误携带：view.errorWatch 摘要可见（游标 + 最近一次上报）', vE.errorWatch && typeof vE.errorWatch.cursor === 'number' && vE.errorWatch.lastReport !== null, JSON.stringify(vE.errorWatch))
+check('错误携带：view.rules 暴露开关与上限（5 条 / 2000 字符）', vE.rules.errorWatchEnabled === true && vE.rules.errorWatchCount === 5 && vE.rules.errorWatchMaxChars === 2000, JSON.stringify(vE.rules))
+
+poolE.unbind('sess-E1')
+await poolE.bind('sess-E1')
+sE.addErrors('解绑期间冒出的错误')
+const e9 = await callE()
+check('错误携带：解绑→重绑重建基线（不回溯解绑期间的错误）', e9.errorWatch === undefined, JSON.stringify(e9).slice(0, 200))
+
+// 自定义上限：errorWatchCount=2 / errorWatchMaxChars=40
+const sH = makeMcpServer([{ id: 'ProjH2@hhhh2222', name: 'ProjH2', hash: 'hhhh2222' }], { consoleCounts: true })
+await sH.listen()
+const poolH = createPool(ctx, {
+  services: [{ id: 'SH', name: '服务H', url: 'http://127.0.0.1:' + sH.port() + '/mcp' }],
+  dataFile: dataFile + '.sH',
+  probeIntervalMs: 5000,
+  busyWaitEnabled: false,
+  errorWatchCount: 2,
+  errorWatchMaxChars: 40,
+})
+await poolH.probe()
+await poolH.bind('sess-H2')
+await poolH.proxyMcp('sess-H2', 'manage_scene', { action: 'get_hierarchy' }) // 基线
+sH.addErrors('错误 1 ' + 'y'.repeat(80), '错误 2', '错误 3')
+const h1 = await poolH.proxyMcp('sess-H2', 'manage_scene', { action: 'get_hierarchy' })
+check('错误携带：errorWatchCount 生效（只显示 2 条）', h1.errorWatch && h1.errorWatch.newErrorCount === 3 && h1.errorWatch.shown === 2, JSON.stringify(h1.errorWatch).slice(0, 300))
+check('错误携带：errorWatchMaxChars 生效（单条按 40 字符截断）', /仅显示前 40 字符/.test(h1.errorWatch.entries[0]), String(h1.errorWatch.entries[0]))
+
+// 漂移校正：读明细期间 Console 又冒出新错误（read_console 回「最新 N 条」会把窗口后移）
+sE.addErrors('本批第 1 条', '本批第 2 条')
+sE.setErrorOnRead('读取期间冒出的错误')
+const e10 = await callE()
+check('错误携带：读明细竞态下仍从本批第 1 条开始（窗口按全局下标对齐）', e10.errorWatch && /本批第 1 条/.test(e10.errorWatch.entries[0]), JSON.stringify(e10.errorWatch).slice(0, 400))
+check('错误携带：漂移期间新增的错误一并纳入本批计数', e10.errorWatch.newErrorCount === 3, JSON.stringify(e10.errorWatch).slice(0, 300))
+const e11 = await callE()
+check('错误携带：漂移条目已消费，不再重复上报', e11.errorWatch === undefined, JSON.stringify(e11).slice(0, 200))
+
+// 关闭堆栈：errorWatchStacktrace=false → read_console 用 plain（只回文案，省字符）
+const sS = makeMcpServer([{ id: 'ProjS@ssss1111', name: 'ProjS', hash: 'ssss1111' }], { consoleCounts: true })
+await sS.listen()
+const poolS = createPool(ctx, {
+  services: [{ id: 'SS', name: '服务S', url: 'http://127.0.0.1:' + sS.port() + '/mcp' }],
+  dataFile: dataFile + '.sS',
+  probeIntervalMs: 5000,
+  busyWaitEnabled: false,
+  errorWatchStacktrace: false,
+})
+await poolS.probe()
+await poolS.bind('sess-S1')
+await poolS.proxyMcp('sess-S1', 'manage_scene', { action: 'get_hierarchy' }) // 基线
+sS.addErrors('无堆栈错误 1')
+const sr1 = await poolS.proxyMcp('sess-S1', 'manage_scene', { action: 'get_hierarchy' })
+check('错误携带：errorWatchStacktrace=false → 纯文案（无文件行/堆栈）', sr1.errorWatch && sr1.errorWatch.entries[0] === '无堆栈错误 1', JSON.stringify(sr1.errorWatch))
+poolS.stop(); sS.close()
+
+// 关闭开关：不检查、不携带（零额外探测）
+const sF = makeMcpServer([{ id: 'ProjF1@ffff1111', name: 'ProjF1', hash: 'ffff1111' }], { consoleCounts: true })
+await sF.listen()
+const poolF = createPool(ctx, {
+  services: [{ id: 'SF', name: '服务F', url: 'http://127.0.0.1:' + sF.port() + '/mcp' }],
+  dataFile: dataFile + '.sF',
+  probeIntervalMs: 5000,
+  busyWaitEnabled: false,
+  errorWatchEnabled: false,
+})
+await poolF.probe()
+await poolF.bind('sess-F1')
+sF.addErrors('错误 1', '错误 2')
+const f1 = await poolF.proxyMcp('sess-F1', 'manage_scene', { action: 'get_hierarchy' })
+check('错误携带：errorWatchEnabled=false 关闭后不检查也不携带', f1.success === true && f1.errorWatch === undefined && sF.probeCount() === 0, 'probes=' + sF.probeCount())
+
+// 降级：Unity 侧计数不可用（老版本/反射失败）→ 只跟踪编译跃迁，不误报错误
+const sG = makeMcpServer([{ id: 'ProjG2@gggg2222', name: 'ProjG2', hash: 'gggg2222' }], { consoleCounts: false, busyPattern: [true, false] })
+await sG.listen()
+const poolG = createPool(ctx, {
+  services: [{ id: 'SG', name: '服务G', url: 'http://127.0.0.1:' + sG.port() + '/mcp' }],
+  dataFile: dataFile + '.sG',
+  probeIntervalMs: 5000,
+  busyMaxWaitMs: 500,
+  busyWaitIntervalMs: 20,
+})
+await poolG.probe()
+await poolG.bind('sess-G2')
+const g1 = await poolG.proxyMcp('sess-G2', 'manage_scene', { action: 'get_hierarchy' })
+check('错误携带：Console 计数不可用时降级为只报编译事件', g1.errorWatch && g1.errorWatch.compileDetected === true && g1.errorWatch.newErrorCount === 0, JSON.stringify(g1.errorWatch))
+check('错误携带：降级时不误读 read_console（无错误明细请求）', sG.calls.every(c => c.tool !== 'read_console'), JSON.stringify(sG.calls.map(c => c.tool)))
+
+poolE.stop(); poolF.stop(); poolG.stop(); poolH.stop()
+sE.close(); sF.close(); sG.close(); sH.close()
+
+// ---------- v0.5.4 工具排序：本工程自定义工具排在官方 Unity MCP 工具之前 ----------
+// 自定义名单取自官方资源 mcpforunity://custom-tools（按当前激活实例）；组内保持服务端原序。
+const ORDER_TOOLDEFS = [
+  { name: 'execute_code', description: '官方：执行 C#', inputSchema: { type: 'object', properties: {} } },
+  { name: 'manage_scene', description: '官方：场景', inputSchema: { type: 'object', properties: {} } },
+  { name: 'read_console', description: '官方：控制台', inputSchema: { type: 'object', properties: {} } },
+  { name: 'ui_snapshot', description: '自定义：UI 快照', inputSchema: { type: 'object', properties: {} } },
+  { name: 'manage_gameobject', description: '官方：GameObject', inputSchema: { type: 'object', properties: {} } },
+  { name: 'gfind', description: '自定义：场景查找', inputSchema: { type: 'object', properties: {} } },
+]
+{
+  const sO = makeMcpServer([{ id: 'ProjO@oooo1111', name: 'ProjO', hash: 'oooo1111' }], {
+    toolDefs: ORDER_TOOLDEFS,
+    customTools: ['gfind', 'ui_snapshot', 'tsvp_diag'], // tsvp_diag 已在 Unity 注册但服务端未暴露 → 求交后不列
+  })
+  await sO.listen()
+  const regO = []
+  const ctxO = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { regO.push(def); return () => {} } } }
+  const poolO = createPool(ctxO, {
+    services: [{ id: 'SO', name: '服务O', url: 'http://127.0.0.1:' + sO.port() + '/mcp' }],
+    dataFile: dataFile + '.sO',
+    probeIntervalMs: 5000,
+  })
+  await poolO.probe()
+  const bO = await poolO.bind('sess-O')
+  const namesO = bO.tools.map(t => t.name)
+  check('工具排序：bind 返回列表自定义工具排最前', namesO.slice(0, 2).join(',') === 'ui_snapshot,gfind', namesO.join(','))
+  check('工具排序：官方工具随后且组内保持服务端原序', namesO.slice(2).join(',') === 'execute_code,manage_scene,read_console,manage_gameobject', namesO.join(','))
+  check('工具排序：bind 附 customTools 名单（与服务端暴露列表求交，未暴露的 tsvp_diag 不列）', bO.customToolsCount === 2 && bO.customTools.includes('gfind') && !bO.customTools.includes('tsvp_diag'), JSON.stringify(bO.customTools))
+  const umcpO = regO.filter(t => t.name.startsWith('umcp_')).map(t => t.name)
+  check('★ 工具排序：umcp_* 原生工具注册顺序也是自定义在前（模型工具清单顺序）', umcpO.slice(0, 2).join(',') === 'umcp_ui_snapshot,umcp_gfind', umcpO.join(','))
+  const gfindDef = regO.find(t => t.name === 'umcp_gfind')
+  const sceneDef = regO.find(t => t.name === 'umcp_manage_scene')
+  check('工具排序：自定义工具描述带「★本工程自定义工具」标记', Boolean(gfindDef) && /★本工程自定义工具/.test(gfindDef.description) && !/★本工程自定义工具/.test(sceneDef.description), String(gfindDef && gfindDef.description).slice(0, 120))
+  const vO = poolO.view('sess-O')
+  check('工具排序：view.tools.names 自定义在前 + customNames 单列', vO.tools.names.slice(0, 2).join(',') === 'ui_snapshot,gfind' && vO.tools.customCount === 2, JSON.stringify(vO.tools))
+  check('工具排序：view.nativeTools 摘要保留注册顺序（自定义在前）', vO.nativeTools[0].names.slice(0, 2).join(',') === 'umcp_ui_snapshot,umcp_gfind', JSON.stringify(vO.nativeTools[0].names))
+  check('工具排序：view.rules 暴露 customToolsFirst', vO.rules.customToolsFirst === true, JSON.stringify(vO.rules))
+  // 代理转发后重拉 tools/list 也保持排序（动态工具集合变化场景）
+  sO.addTool('gnew')
+  const rO = await poolO.proxyMcp('sess-O', 'gnew', {})
+  check('工具排序：动态新增工具触发重拉后仍不打乱（自定义仍在前）', rO.success === true && poolO.view('sess-O').tools.names.slice(0, 2).join(',') === 'ui_snapshot,gfind', JSON.stringify(poolO.view('sess-O').tools.names))
+  poolO.stop(); sO.close()
+}
+// 关闭开关：保持服务端原序，不附 customTools
+{
+  const sN = makeMcpServer([{ id: 'ProjN@nnnn1111', name: 'ProjN', hash: 'nnnn1111' }], { toolDefs: ORDER_TOOLDEFS, customTools: ['gfind', 'ui_snapshot'] })
+  await sN.listen()
+  const poolN = createPool(ctx, {
+    services: [{ id: 'SN', name: '服务N', url: 'http://127.0.0.1:' + sN.port() + '/mcp' }],
+    dataFile: dataFile + '.sN',
+    probeIntervalMs: 5000,
+    customToolsFirst: false,
+  })
+  await poolN.probe()
+  const bN = await poolN.bind('sess-N')
+  check('工具排序：customToolsFirst=false 保持服务端原序', bN.tools.map(t => t.name).join(',') === ORDER_TOOLDEFS.map(t => t.name).join(','), bN.tools.map(t => t.name).join(','))
+  check('工具排序：关闭时不附 customTools 字段', bN.customTools === undefined && poolN.view('sess-N').rules.customToolsFirst === false, JSON.stringify(bN.customTools))
+  poolN.stop(); sN.close()
+}
+// 老服务端（无 mcpforunity://custom-tools 资源）：退化为服务端原序，不报错
+{
+  const sL = makeMcpServer([{ id: 'ProjL2@llll1111', name: 'ProjL2', hash: 'llll1111' }], { toolDefs: ORDER_TOOLDEFS })
+  await sL.listen()
+  const poolL = createPool(ctx, {
+    services: [{ id: 'SL', name: '服务L', url: 'http://127.0.0.1:' + sL.port() + '/mcp' }],
+    dataFile: dataFile + '.sL',
+    probeIntervalMs: 5000,
+  })
+  await poolL.probe()
+  const bL = await poolL.bind('sess-L2')
+  check('工具排序：老服务端无 custom-tools 资源 → 原序不崩', bL.tools.map(t => t.name).join(',') === ORDER_TOOLDEFS.map(t => t.name).join(',') && bL.customTools === undefined, bL.tools.map(t => t.name).join(','))
+  const rL = await poolL.proxyMcp('sess-L2', 'manage_scene', { action: 'get_hierarchy' })
+  check('工具排序：老服务端下代理调用照常成功', rL.success === true, JSON.stringify(rL).slice(0, 150))
+  poolL.stop(); sL.close()
+}
 
 // ---------- 归档语义（v0.5.1）：实例掉线/域重载对绑定会话无感，仅「会话归档」才解绑 ----------
 // 实例掉线/服务离线 → probe 不主动解绑（绑定保持）；真正的实例离线只在调用时由 proxyMcp

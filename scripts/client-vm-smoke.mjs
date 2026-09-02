@@ -94,6 +94,7 @@ const STATE_OFF = { enabled: false, switches: { stateEnabled: false, stateGameSc
 const STATE_ON = { enabled: true, switches: { stateEnabled: true, stateGameScreenshot: true, stateSceneScreenshot: false, stateSelection: false, stateUiSnapshot: false, stateSerialized: false, stateConsoleAll: false, stateConsoleSelected: false }, refreshMs: 3000, maxChars: 8000, cache: { at: Date.now(), instanceId: 'ProjX@aaaa1111', entries: [{ key: 'stateGameScreenshot', label: 'Game 截图', ok: true, file: 'C:/tmp/1.png' }] } }
 let serverState = JSON.parse(JSON.stringify(STATE_OFF))
 const fetched = []
+let lastBindBody = null // 最近一次 /api/bind 请求体（断言不再发 force=false）
 let staleStatus = false // 下一次 /api/status 返回"请求发出时"的旧快照（延迟 30ms），模拟轮询响应晚于用户切换
 // viewOf.binding 可变：模拟宿主侧绑定/解绑（面板锁定按钮 / agent 工具 / 其它标签页）
 // ProjY 模拟被其它会话占用：普通 bind 409，force 才成功
@@ -123,10 +124,11 @@ function mockFetch(url, opts) {
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/bind')) {
     const body = JSON.parse((opts && opts.body) || '{}')
+    lastBindBody = body
     const inst = String(body.instance || '')
-    if (inst === 'ProjY@oooo2222' && !body.force) {
-      // 模拟实例被其它会话锁定：普通绑定 409
-      return Promise.resolve({ json: () => Promise.resolve({ ok: false, error: { message: '实例 [ProjY@oooo2222] 已被会话 sess-OTHER 锁定（并行开发请锁定不同实例；确认后可传 force=true）' } }) })
+    if (inst === 'ProjY@oooo2222' && body.force === false) {
+      // 与真实宿主一致（v0.5.1）：force 默认 true，仅显式 force=false 才按 enforceExclusive 拒绝
+      return Promise.resolve({ json: () => Promise.resolve({ ok: false, error: { message: '实例 [ProjY@oooo2222] 正被其他会话并行使用（enforceExclusive 默认开启；并行开发同一实例属正常用法）。如需同时绑定可传 force=true' } }) })
     }
     viewOf.binding = { serviceId: 'S1', instance: { name: inst.startsWith('ProjY') ? 'ProjY' : 'ProjX', id: inst } }
     const v = { sessionId: MOCK_SESSION, view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)) } }
@@ -286,9 +288,9 @@ await new Promise(r => setTimeout(r, 0))
 const c4 = chipOf(await settle(ut.Comp, props, 2))
 check('★ 面板点「解绑」后胶囊即时变回 Unity', c4 && c4.label === 'Unity' && c4.dot === '#888' && fetched.slice(beforeUnbind).some(u => u.includes('/api/unbind')), JSON.stringify(c4))
 
-// ---------- 并行锁定：实例被其它会话占用时自动 force 重试（v0.4.1） ----------
-// 当前未绑定（上条已解绑）；ProjY 被 sess-OTHER 占用：点 ProjY 行的「锁定」
-// → 普通 bind 409（"已被会话锁定"）→ 自动 force=true 重试 → 绑定成功
+// ---------- 并行锁定（v0.5.3 修复）：直接默认绑定，不再先 force=false 试探 ----------
+// 旧实现先发 force=false、再按错误文案 /已被会话/ 自动重试；v0.5.1 改了拒绝文案 → 匹配失效 →
+// 用户点「锁定」只看到 enforceExclusive 报错、根本绑不上。现在一次默认绑定（force 交给服务端默认 true）。
 const utTreeF = await settle(ut.Comp, props, 2)
 const lockBtns = buttons(utTreeF).filter(b => b.props.children === '锁定')
 check('未绑定后面板显示两个「锁定」按钮（ProjX/ProjY 行）', lockBtns.length === 2, 'buttons=' + lockBtns.length)
@@ -296,9 +298,10 @@ const beforeForce = fetched.length
 lockBtns[1].props.onClick() // ProjY（被占用）
 await new Promise(r => setTimeout(r, 0))
 const bindCalls = fetched.slice(beforeForce).filter(u => u.includes('/api/bind'))
-check('★ 并行锁定：先普通 bind 失败后自动 force 重试（两次 bind 调用）', bindCalls.length === 2, JSON.stringify(bindCalls))
+check('★ 并行锁定：只发一次 bind（不再 force=false 试探后重试）', bindCalls.length === 1, JSON.stringify(bindCalls))
+check('★ 并行锁定：请求体不带 force=false（默认并行可绑）', lastBindBody && lastBindBody.force === undefined, JSON.stringify(lastBindBody))
 const c5 = chipOf(await settle(ut.Comp, props, 2))
-check('★ 并行锁定：胶囊即时显示 ProjY（force 成功）', c5 && c5.label === 'ProjY' && c5.dot === '#30a46c', JSON.stringify(c5))
+check('★ 并行锁定：胶囊即时显示 ProjY（默认即允许并行）', c5 && c5.label === 'ProjY' && c5.dot === '#30a46c', JSON.stringify(c5))
 const utTreeG = await settle(ut.Comp, props)
 const lockedRows = buttons(utTreeG).filter(b => b.props.children === '已锁定')
 check('面板 ProjY 行变为「已锁定」', lockedRows.length >= 1, 'locked=' + lockedRows.length)
@@ -321,6 +324,51 @@ check('★ 旧轮询快照晚到不覆盖新切换：dock 总开关保持开', i
 const utAfter = await settle(ut.Comp, props, 1)
 check('★ 旧轮询快照晚到不覆盖新切换：面板总开关保持开', inputs(utAfter).length === 8 && inputs(utAfter)[0].props.checked === true, JSON.stringify(inputs(utAfter)[0] && inputs(utAfter)[0].props))
 
+
+// ---------- v0.5.3：dock 内绑定入口（新会话没有会话头部槽 → 头部胶囊不渲染，绑定入口必须在 dock） ----------
+const EV = { stopPropagation() {} }
+viewOf.binding = null
+let dTree = await settle(dock.Comp, props, 2)
+function dockBindBtnOf(tree) {
+  return buttons(tree).find(b => {
+    const t = String((b.props && b.props.title) || '')
+    return /未锁定 Unity 实例|已锁定：/.test(t)
+  })
+}
+let bindBtn = dockBindBtnOf(dTree)
+check('★ dock 渲染绑定入口按钮（未绑定时提示可提前绑定）', Boolean(bindBtn) && /新会话也可提前绑定/.test(String(bindBtn.props.title)), bindBtn && String(bindBtn.props.title))
+const bindLabelSpans = collect(bindBtn, n => n.type === 'span' && n.props.children === '绑定 Unity', [])
+check('dock 绑定入口未绑定时文案为「绑定 Unity」', bindLabelSpans.length === 1, JSON.stringify(collect(bindBtn, n => n.type === 'span', []).map(s => s.props.children)))
+
+const beforeOpen = fetched.length
+bindBtn.props.onClick(EV)
+dTree = await settle(dock.Comp, props, 2)
+check('dock 点开绑定浮窗：拉取服务池 /api/status', fetched.slice(beforeOpen).some(u => u.includes('/api/status')), fetched.slice(beforeOpen).join(','))
+const dockLockBtns = buttons(dTree).filter(b => b.props.children === '锁定')
+check('★ dock 浮窗列出实例并给「锁定」按钮（ProjX/ProjY）', dockLockBtns.length === 2, 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+
+const beforeDockBind = fetched.length
+lastBindBody = null
+dockLockBtns[0].props.onClick()
+await new Promise(r => setTimeout(r, 0))
+check('★ dock 浮窗锁定：发一次 bind 且不带 force=false', fetched.slice(beforeDockBind).filter(u => u.includes('/api/bind')).length === 1 && lastBindBody && lastBindBody.force === undefined, JSON.stringify(lastBindBody))
+dTree = await settle(dock.Comp, props, 2)
+bindBtn = dockBindBtnOf(dTree)
+check('★ dock 绑定后入口显示实例名（不等轮询）', Boolean(bindBtn) && collect(bindBtn, n => n.type === 'span' && n.props.children === 'ProjX', []).length === 1, bindBtn && JSON.stringify(collect(bindBtn, n => n.type === 'span', []).map(s => s.props.children)))
+const c6 = chipOf(await settle(ut.Comp, props, 2))
+check('★ dock 绑定即时同步到头部胶囊（共享 store）', c6 && c6.label === 'ProjX', JSON.stringify(c6))
+
+const beforeDockUnbind = fetched.length
+const dockUnbindBtn = buttons(dTree).find(b => b.props.children === '解绑')
+check('dock 浮窗已绑定时显示「解绑」', Boolean(dockUnbindBtn), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+dockUnbindBtn.props.onClick()
+await new Promise(r => setTimeout(r, 0))
+check('dock 浮窗解绑：走 /api/unbind', fetched.slice(beforeDockUnbind).some(u => u.includes('/api/unbind')), fetched.slice(beforeDockUnbind).join(','))
+dTree = await settle(dock.Comp, props, 2)
+bindBtn = dockBindBtnOf(dTree)
+check('★ dock 解绑后入口回到「绑定 Unity」', Boolean(bindBtn) && collect(bindBtn, n => n.type === 'span' && n.props.children === '绑定 Unity', []).length === 1, bindBtn && JSON.stringify(collect(bindBtn, n => n.type === 'span', []).map(s => s.props.children)))
+const dockScanBtn = buttons(dTree).find(b => b.props.children === '扫描')
+check('dock 浮窗提供「扫描」（实例不在列表时可重扫）', Boolean(dockScanBtn), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
 
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILED: ' + failures)
 process.exit(failures === 0 ? 0 : 1)

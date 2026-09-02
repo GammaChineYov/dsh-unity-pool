@@ -91,6 +91,12 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     # ---- 原生工具注册（v0.5.0，Claude 式工具清单）----
     nativeToolsEnabled: true   # 绑定成功后把该服务的 MCP 工具动态注册为原生工具（umcp_<工具名>），模型上下文直接可见可调
     nativeToolSchema: compact  # 参数 schema 形态：compact=基础标量类型+description、复杂参数不展开（省上下文，默认）；full=完整 inputSchema（与 Claude 注册 MCP 工具一致，参数校验最全但上下文开销大）
+    # ---- 错误日志携带（v0.5.2，默认开）----
+    errorWatchEnabled: true    # 每次 unity_mcp/umcp_* 调用「前后各检查一次」Console：期间新增的错误（编译错误/运行时报错）随本次调用结果返回
+    errorWatchCount: 5         # 单次最多携带的新增错误条数（取新增批次里最早的 N 条）
+    errorWatchMaxChars: 2000   # 单条错误文本最大字符数（超出截断并标注）
+    errorWatchFetchMax: 50     # 拉取明细时最多读取的 Console 条数（防超大批次拖慢）
+    errorWatchStacktrace: true # 明细是否带堆栈（运行时错误靠堆栈定位；单条仍受 errorWatchMaxChars 截断）
     # ---- 状态携带（v0.4.0，默认全关）----
     stateEnabled: false           # 总开关：每次发出指令时在上下文携带 Unity 状态快照
     stateGameScreenshot: false    # Game 视图截图（PNG 落盘 stateDir，上下文给路径）
@@ -111,6 +117,8 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 
 **开关位置（方便按需切换）**：客户端在会话头部「Unity」胶囊（点开面板末段）与**输入框上方**（`conversation.input.dock` 槽，聊天输入框正上方一条）各有一组状态携带开关（总开关 + 7 项子开关），运行时点击即切（走 `POST /api/state-switch`，无需重启）；**开关按会话独立（v0.4.2）**——每个会话自己的开关（`stateSwitchesBySession` 按 sessionId 持久化，重启后本会话恢复上次设置），切换只影响本会话的采集/注入；**未绑定 Unity 也可切换**（预配置，灰显提示「未绑定 Unity，绑定后生效」，绑定后立即生效；子开关在总开关关闭时禁用）；开启总开关后每次发出指令自动注入最近一次快照——需要传状态的指令前开一下、不需要时关掉即可。旧版全局平铺 `stateSwitches` 自动迁移为全局默认层（所有会话的未覆盖项继承它）。
 
+**绑定入口两处（v0.5.3）**：头部「Unity」胶囊只在已有会话头部时存在，**新会话（首条消息前）没有头部槽** → 绑定入口另落在输入框上方 dock 左端的绑定芯片（点开 = 服务池实例列表 + 锁定/解绑/扫描），因此新会话也能提前绑定实例；两处都按默认绑定（并行开发同一实例是正常用法，不再先试探 `force:false` 再重试）。
+
 **两处 UI 同源（v0.4.1）**：头部胶囊、输入条 dock 的开关与绑定状态共用客户端共享状态源（模块级 pub-sub store，按 sessionId 分槽）——任一入口切换/绑定/解绑立即广播，另一入口即时同步；胶囊另有 5s 轻轮询兜底（agent 工具调用 `unity_pool_bind`/`unity_pool_unbind`、其它标签页的变化 ≤5s 自动反映到胶囊，无需手动刷新）。
 
 ## Agent 工具
@@ -120,8 +128,8 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 | `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活 + instancesValid/offlineStreak）+ 本会话锁定 + 最近归档自动解绑 lastAutoUnbind；**已绑定时附带该服务最新工具名速查 `tools: {count, names}`** |
 | `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务 |
 | `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**每次绑定都返回该服务最新 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**（同服务重复绑定也重拉保持新鲜；拉取失败回退上次缓存并附 `toolsError`，不阻断绑定）；**绑定后该服务工具自动注册为原生工具 `umcp_<工具名>`（v0.5.0）**——模型上下文直接可见全部工具名/描述/参数并原生调用（等价 `unity_mcp` 转发，未绑定会话调用报「未锁定目标实例」）；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
-| `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**工具名不存在时错误信息附带当前可用工具名列表（含相似工具名提示）**，选正确名称重试即可；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃） |
-| `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话 |
+| `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**工具名不存在时错误信息附带当前可用工具名列表（含相似工具名提示）**，选正确名称重试即可；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃）；**调用前后各检查一次 Console（v0.5.2）**——期间新增的错误（编译错误/运行时报错）随本次结果返回（结构化 `errorWatch` + 文本附在 `text` 末尾，默认前 5 条、单条 2000 字符，同一批只返回一次） |
+| `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话（同时清掉本会话的错误携带游标，重绑后重建基线） |
 | `unity_pool_state` | 查看/刷新本会话的 Unity 状态携带快照（v0.4.0）：立即采集一次并按开关返回各项状态（截图文件路径/选中项/序列化字段/Console）+ view.state（开关值与缓存摘要）；`refresh:false` 只读缓存 |
 
 `unity_mcp` 参数：`tool`（mcp-for-unity 工具名，如 manage_scene / manage_gameobject / manage_camera / read_console）、`params`（工具参数对象）、`instance`（可选临时覆盖）。
@@ -140,11 +148,15 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 186 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 207 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
 
+- `0.5.4` **新增 Console 错误状态携带开关**：新增第 8 项子开关 `stateConsoleError`（面板/输入框 dock 均加「Console 错误 / Console错」项，默认关）——状态携带时只采集 `read_console types=['error']` 的 **error 级**条目（复用 `stateConsoleCount`/`stateConsoleMaxChars` 与最新优先截断），让注入的 Console 一眼看到错误而非全文噪音；为 `stateConsoleAll`/`stateConsoleSelected` 之外的独立开关，互不影响。
+- `0.5.4` **修复 Console 状态携带「只见旧不见新」**：状态携带的 Console 全文（`stateConsoleAll`）此前把 `read_console` 返回的**旧→新**条目 join 后按 `slice(0, maxChars)` 保留**开头（最旧）**——一旦最近 N 条超出 `stateConsoleMaxChars`（默认 6000；长的 JSON 请求/响应日志极易超），**最新日志被整段裁掉**。于是注入的 Console 既不是全程日志（`count` 只回最近 N 条）也不是最新日志——「不是新的也不是旧的」。新增 Console 专用 `UnityPool.truncateConsole(entries, maxChars, label)`：按行从**尾部（最新）**向前累加，尽量整条保留；单条超预算时掐该条尾部；前缀标注「…[Console 超预算：显示最新 X 条，省略 Y 条更早日志（原 N 条 / M 字符）]」。`consoleAll` 改为捕获条目数组后用 `truncateConsole`（`truncate` 通用助手用于选中项/序列化字段，保持不变）。
+- `0.5.3` **新会话可提前绑定 + 修复「点锁定必报 enforceExclusive」**：① 绑定入口下沉到输入框上方的 dock——新会话（首条消息之前）根本没有会话头部槽，头部「Unity」胶囊不渲染，于是无法提前绑定实例；现在 dock 左端多一个绑定芯片（未绑定显示「绑定 Unity」、已绑定显示实例名 + 存活点），点开是服务池实例列表（锁定/解绑/扫描），与头部面板经共享 store 即时同源。② 面板「锁定」按钮此前先发 `force:false` 试探、再按错误文案 `/已被会话/` 自动 force 重试，而 v0.5.1 把拒绝文案改成了「正被其他会话并行使用（enforceExclusive…）」→ 匹配失效 → 用户点「锁定」只看到报错、根本绑不上；并行开发同一实例本来就是正常用法，现在两处入口都**直接按默认绑定**（force 交给服务端默认 true），不再试探重试。client VM 冒烟扩到 45 项（含 dock 绑定入口开合/锁定/解绑/扫描、bind 请求体不带 force、两处即时同源）。
+- `0.5.2` **错误日志携带（编译错误 + 运行时新增错误，同一管线）**：每次 `unity_mcp`/`umcp_*` 调用在**转发前后各检查一次** Unity 状态——前检查复用忙等待循环的探测（零额外往返），后检查一次 `execute_code`；探测顺带取 Console 计数（`LogEntries.GetCountsByType` 反射，取不到则降级为只跟踪编译跃迁）。错误计数相对上次上报游标增长 → 本次调用结果直接带回新增错误明细（`read_console types:['error']`，默认带堆栈）：结构化字段 `errorWatch`（`newErrorCount`/`compileDetected`/`compileErrors`/`entries`）+ 文本附在 `text` 末尾（模型直接可见）；**默认前 5 条、单条 2000 字符截断**（`errorWatchCount`/`errorWatchMaxChars`）。**去重语义**：游标推进 = 同一批错误只在**一次**工具调用中返回一次；会话内首次调用只建立基线（不回溯历史错误）；Console 被 Clear（计数回落）游标回退不误报；解绑→重绑重建基线；检测到编译完成但无新增错误时回一行「编译完成，Console 无新增错误」（可当编译通过确认）。新增配置 `errorWatchEnabled`/`errorWatchCount`/`errorWatchMaxChars`/`errorWatchFetchMax`/`errorWatchStacktrace`，`view.rules`+`view.errorWatch`+HTTP `/api/config` 同步暴露；调用后探测状态另回传 `editorStateAfter`。明细走 `read_console format=detailed`（`[Error] 文案 (at 文件:行)` + 堆栈；`errorWatchStacktrace:false` 时改用 plain 只回文案）。**漂移校正**：`read_console` 回的是「最新 N 条」，读明细期间 Console 又冒出错误会把窗口整体后移（真机实测漏掉本批最早那条）——改为多取余量条 + 读完再探一次当下计数，按全局下标把窗口对齐回本批起点，漂移期间新增的错误一并纳入本批（不留到下次重复刷）。smoke 扩到 207 项全过（含降级/清空/上限/堆栈开关/读取竞态/关闭开关等 26 项新用例）。
 - `0.5.1` **dock 对齐输入框修复**：输入框上方两条 dock（`⚡ 转译` 与 Unity 状态携带开关条）此前未套 `--dsh-composer-*` 共享几何（`width: calc(100% - 2×side-clearance - 4×dock-inset)` + `margin: 0 auto` + `max-width`），撑满整列导致与居中输入卡片错位、两条 dock 彼此也未对齐。`lib/client.js` 的 `dockWrap` 行内样式与 `.prep-dock` CSS 补上同一套居中限宽几何（复用 `var(--dsh-composer-side-clearance)` / `var(--dsh-composer-dock-inset)` / `var(--dsh-composer-card-max-width)`），与官方 todo/goal/queue dock 卡片同宽居中；client 刷新页面即生效。
 - `0.5.1` **归档语义修正（修复「进 Play 域重载被 autoUnbindOnArchive 解绑」）**：归档的定义改为「本 DSH 会话被归档（session/disposed）」→ 自动解绑该会话锁定的实例，而不是「实例被归档」。实例掉线/域重载对已绑定会话是无感的——绑定保持、不做 probe 主动解绑、也不注入通知（移除 notifyUnbindOnArchive / unbindOfflineStreak / unbindArchiveGraceMs）。真正的实例离线只在调用时处理：unity_mcp/umcp_* 路由到实例时给足超时（新增 `callReconnectTimeoutMs`，默认 20s）让官方 mcp-for-unity 服务端的会话重连等待（默认 20s）完成，超过才判定实例离线并返回失败原因（不再抛出）。订阅 `session/disposed` 作为唯一自动解绑入口（autoUnbindOnArchive 默认开启）。smoke 重构归档场景，181 项全过。
 - `0.1.0` v1：会话→服务绑定 + 探活 + 面板；
