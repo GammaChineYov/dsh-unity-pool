@@ -1506,6 +1506,128 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
   fsp.rm(dataFile + '.hangtool', { force: true }).catch(() => {})
 }
 
+// ---------- v0.5.6 冷启动补齐：新会话开启状态后首条消息必须带状态块 ----------
+{
+  const sCold = makeMcpServer([{ id: 'ProjC@cccc3333', name: 'ProjC', hash: 'cccc3333' }])
+  await sCold.listen()
+  const coldTools = []
+  const coldContexts = []
+  const coldHandlers = {}
+  const coldRoutes = []
+  const coldCtx = {
+    logger: { info() {}, warn() {}, error() {} },
+    effect(fn) { fn(); return () => {} },
+    inject(services, fn) { fn({ effect: coldCtx.effect, webServer: coldCtx.webServer }) },
+    tools: { register(def) { coldTools.push(def); return () => {} } },
+    systemPrompt: { section() {}, context(c) { coldContexts.push(c) } },
+    webServer: { register(r) { coldRoutes.push(r); return () => {} } },
+    on(ev, fn) { (coldHandlers[ev] = coldHandlers[ev] || []).push(fn); return () => {} },
+  }
+  apply(coldCtx, {
+    services: [{ id: 'SC', name: '服务C', url: 'http://127.0.0.1:' + sCold.port() + '/mcp' }],
+    dataFile: dataFile + '.cold',
+    probeIntervalMs: 600000,
+    probeTimeoutMs: 3000,
+    scanPorts: [],
+    stateFirstTurnWaitMs: 4000,
+  })
+  const coldHandler = coldRoutes[0].handler
+  function cRes() {
+    const out = { status: 0, body: '' }
+    let resolveEnd
+    const done = new Promise(r => { resolveEnd = r })
+    const res = { writeHead(s) { out.status = s; return this }, end(b) { out.body = String(b); resolveEnd(out); return this } }
+    return { res, done }
+  }
+  async function coldPost(url, body) {
+    const { res, done } = cRes()
+    const req = fakeReq('POST', url, body)
+    coldHandler(req, res)
+    req._emit('data', Buffer.from(JSON.stringify(body)))
+    req._emit('end')
+    await done
+    return JSON.parse(res._out ? res._out.body : '{}')
+  }
+  async function coldGet(url) {
+    const { res, done } = cRes()
+    await coldHandler(fakeReq('GET', url), res)
+    const out = await done
+    return JSON.parse(out.body)
+  }
+
+  const sidCold = 'sess-COLD'
+  await coldTools.find(t => t.name === 'unity_pool_scan').execute({}, { agent: { id: sidCold } })
+  await coldPost('/unity-pool/api/state-switch', { sessionId: sidCold, key: 'stateEnabled', value: true })
+  await coldPost('/unity-pool/api/state-switch', { sessionId: sidCold, key: 'stateSelection', value: true })
+  const cacheBefore = (await coldGet('/unity-pool/api/state?sessionId=' + sidCold)).value.cache
+  check('冷启动：绑定前无状态缓存（正是首条消息的场景）', cacheBefore === null, JSON.stringify(cacheBefore))
+  await coldTools.find(t => t.name === 'unity_pool_bind').execute({ instance: 'ProjC@cccc3333' }, { agent: { id: sidCold } })
+
+  const agentCold = { id: sidCold, session: { id: sidCold, events: [{ type: 'turn/start', data: { turn: 1 } }] } }
+  const evalCold = () => coldContexts.map(c => ({ name: c.name, text: typeof c.text === 'function' ? c.text({ agent: agentCold, scope: agentCold }) : c.text }))
+  check('冷启动：同步 context 求值为空串（修复前形态 = 整回合没有状态块）', evalCold().find(e => e.name === 'unity-pool:state').text === '')
+  const coldAssemble = coldHandlers['system-prompt/assemble'] || []
+  check('冷启动：注册 system-prompt/assemble 装配瀑布', coldAssemble.length === 1)
+  const tCold = Date.now()
+  let asm = { sections: [], contexts: evalCold(), tools: [], variables: {} }
+  for (const h of coldAssemble) asm = await h(asm, { agent: agentCold, scope: agentCold }, async () => asm)
+  const coldText = String(asm.contexts.find(c => c.name === 'unity-pool:state').text)
+  check('★ 冷启动：装配阶段补齐状态块（首条消息即注入）', coldText.includes('<unity_pool_state>') && coldText.includes('当前选中项'), coldText.slice(0, 200))
+  check('冷启动：补齐在预算内完成', Date.now() - tCold < 4000, (Date.now() - tCold) + 'ms')
+  check('冷启动：补齐写入回合缓存（同回合各 step 文本稳定）', evalCold().find(e => e.name === 'unity-pool:state').text === coldText)
+  const tHot = Date.now()
+  let asmHot = { sections: [], contexts: evalCold(), tools: [], variables: {} }
+  for (const h of coldAssemble) asmHot = await h(asmHot, { agent: agentCold, scope: agentCold }, async () => asmHot)
+  check('冷启动：缓存已热时零等待（不重复采集）', Date.now() - tHot < 100, (Date.now() - tHot) + 'ms')
+  const agentOff = { id: 'sess-NOCARRY', session: { id: 'sess-NOCARRY', events: [{ type: 'turn/start', data: { turn: 1 } }] } }
+  const tOff = Date.now()
+  let asmOff = { sections: [], contexts: [{ name: 'unity-pool:state', text: '' }], tools: [], variables: {} }
+  for (const h of coldAssemble) asmOff = await h(asmOff, { agent: agentOff, scope: agentOff }, async () => asmOff)
+  check('冷启动：未开启状态携带的会话不注入不等待', String(asmOff.contexts[0].text) === '' && Date.now() - tOff < 100, (Date.now() - tOff) + 'ms')
+  sCold.close()
+  fsp.rm(dataFile + '.cold', { force: true }).catch(() => {})
+}
+
+// 冷启动补齐：采集失败时有界返回 + 冷却期内不重复等待 + 开关可关闭
+{
+  const sColdHang = makeMcpServer([], { hangBody: true })
+  await sColdHang.listen()
+  const poolColdHang = createPool(ctx, {
+    services: [{ id: 'SH', name: '挂起', url: 'http://127.0.0.1:' + sColdHang.port() + '/mcp' }],
+    dataFile: dataFile + '.coldhang',
+    probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
+    stateFirstTurnWaitMs: 800, stateCollectCooldownMs: 10000,
+  })
+  poolColdHang.setStateSwitch('sess-HANG', 'stateEnabled', true)
+  poolColdHang.setStateSwitch('sess-HANG', 'stateSelection', true)
+  poolColdHang.bindings['sess-HANG'] = { serviceId: 'SH', instanceId: 'Ghost@1', boundAt: Date.now() }
+  const tHangA = Date.now()
+  const rHangA = await poolColdHang.ensureStateTextForTurn('sess-HANG', 1)
+  const msHangA = Date.now() - tHangA
+  check('冷启动：采集失败时有界返回（不挂死）', rHangA === '' && msHangA < 3000, msHangA + 'ms')
+  const tHangB = Date.now()
+  const rHangB = await poolColdHang.ensureStateTextForTurn('sess-HANG', 2)
+  const msHangB = Date.now() - tHangB
+  check('冷启动：冷却期内不重复等待（Unity 离线时不每步都卡）', rHangB === '' && msHangB < 100, msHangB + 'ms')
+  poolColdHang.stop()
+  sColdHang.server.closeAllConnections?.()
+  sColdHang.close()
+  fsp.rm(dataFile + '.coldhang', { force: true }).catch(() => {})
+
+  const poolNoWait = createPool(ctx, {
+    services: [{ id: 'SNW', name: 'n', url: 'http://127.0.0.1:9/mcp' }],
+    dataFile: dataFile + '.coldoff',
+    probeIntervalMs: 600000, stateFirstTurnWaitMs: 0,
+  })
+  poolNoWait.setStateSwitch('sess-NW', 'stateEnabled', true)
+  poolNoWait.setStateSwitch('sess-NW', 'stateSelection', true)
+  const tNoWait = Date.now()
+  const rNoWait = await poolNoWait.ensureStateTextForTurn('sess-NW', 1)
+  check('冷启动：stateFirstTurnWaitMs=0 关闭补齐（立即返回）', rNoWait === '' && Date.now() - tNoWait < 100, (Date.now() - tNoWait) + 'ms')
+  poolNoWait.stop()
+  fsp.rm(dataFile + '.coldoff', { force: true }).catch(() => {})
+}
+
 poolState.stop(); poolTiny.stop(); poolNoSnap.stop()
 sState.close(); sNoSnap.close()
 fsp.rm(stateDir, { recursive: true, force: true }).catch(() => {})

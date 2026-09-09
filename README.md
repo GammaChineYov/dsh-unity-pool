@@ -115,6 +115,8 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     stateSnapshotMaxChars: 4000   # ui-snapshot 最大字符数
     stateConsoleMaxChars: 6000    # Console 文本最大字符数
     stateConsoleCount: 50         # Console 全文读取条数
+    stateFirstTurnWaitMs: 4000    # 冷启动补齐（v0.5.6）：装配阶段发现「开了状态但缓存为空」时有界等待一次采集再注入（新会话/插件重启后首条消息也带状态）；0=关闭
+    stateCollectCooldownMs: 10000 # 冷启动补齐冷却（ms）：采集失败（Unity 离线/繁忙）后这段时间不再重复等待，避免每步都卡
 ```
 
 **开关位置（方便按需切换）**：客户端在会话头部「Unity」胶囊（点开面板末段）与**输入框上方**（`conversation.input.dock` 槽，聊天输入框正上方一条）各有一组状态携带开关（总开关 + 7 项子开关），运行时点击即切（走 `POST /api/state-switch`，无需重启）；**开关按会话独立（v0.4.2）**——每个会话自己的开关（`stateSwitchesBySession` 按 sessionId 持久化，重启后本会话恢复上次设置），切换只影响本会话的采集/注入；**未绑定 Unity 也可切换**（预配置，灰显提示「未绑定 Unity，绑定后生效」，绑定后立即生效；子开关在总开关关闭时禁用）；开启总开关后每次发出指令自动注入最近一次快照——需要传状态的指令前开一下、不需要时关掉即可。旧版全局平铺 `stateSwitches` 自动迁移为全局默认层（所有会话的未覆盖项继承它）。
@@ -150,10 +152,17 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 229 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）+ v0.5.5 扫描卡死回归（响应体永不结束的挂起服务/挂起端口/串行链自愈/工具级预算内返回）（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 240 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）+ v0.5.5 扫描卡死回归（响应体永不结束的挂起服务/挂起端口/串行链自愈/工具级预算内返回）+ v0.5.6 冷启动补齐回归（绑定前无缓存/同步求值为空串/装配瀑布注册/装配阶段补齐/回合缓存/热缓存零等待/未开状态不注入/失败有界返回/冷却不重复等待/开关可关闭）（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
+
+- `0.5.6` **修复「新会话绑定后开启状态、发消息没注入上下文」**：根因是注入路径的同步/异步错配——`systemPrompt.context.text` 是**同步**函数（harness 契约：`text: string | ((context) => string)`），只能读已有缓存；而状态采集是**异步**的（MCP 往返 1~3s）。新会话 / 插件热重载 / 刚打开开关时缓存为空 → 首回合求值拿到空串，且旧代码还把空串写进「按回合缓存」→ **整个回合（含后续 step）都没有状态块**。观察到的现象就是「开了状态、发消息，上下文里没有 Unity 状态」。修复：
+  - ① 新增 `system-prompt/assemble` 装配瀑布监听（唯一可 await 的装配钩子）：条目为空且本会话启用状态携带时，**有界等待一次采集**（`stateFirstTurnWaitMs`，默认 4s；冷却 `stateCollectCooldownMs`，默认 10s）后就地替换该 context 条目 → 首条消息即带状态；缓存已热时零开销（直接返回）。
+  - ② `collectState` 防重入改为**返回同一个在飞 Promise**（原来返回 null）：消息/开关触发的采集正在跑时，装配阶段能等它结束，而不是误判「没在采」。
+  - ③ `stateTextForTurn` **不再缓存空文本**：万一补齐超时，同回合后续 step 仍能拿到采集完成后的状态块（第二道保险）。
+  - ④ `bind` 后/解绑时的既有行为保持：绑定后立即采集一次；解绑清掉冷启动冷却，重绑可立即补齐。
+  - 验证：smoke-test-v2 **240 项全过**（新增 11 项：绑定前无缓存、同步求值为空串（修复前形态）、装配瀑布注册、装配阶段补齐状态块、预算内完成、写入回合缓存、缓存已热零等待、未开状态携带不注入不等待、采集失败有界返回、冷却期内不重复等待、`stateFirstTurnWaitMs=0` 关闭）。另用带 1.5s 往返延迟的 mock 实测：修复前装配文本为空串，修复后瀑布等待 ~3s 并注入状态块。
 
 - `0.5.5` **修复 `unity_pool_scan` 卡死（工具调用永远「运行中」）**：根因在 MCP 客户端——`_request` 在 `fetch` 拿到响应头后就 `clearTimeout`，而超时器本该覆盖到响应体读完；当某个端点只回响应头、响应体永不结束（streamable HTTP 的 SSE 保活/长连接、或端口上挂着非 MCP 服务）时 `res.text()` 永久挂起，该 client 的**串行链被一个永不 settle 的任务占住**，于是 `listInstances`/`probe`/`unity_pool_scan` 之后的所有调用全部排队等死（`unity_pool_scan` 就是「一直运行中」）。修复：① `_request` 的 AbortController 计时器**活到响应体读完**（`finally` 统一清理），超时错误区分「请求失败/响应体未结束」并报真实预算；② `probeService` 增加总预算（`max(5000, probeTimeoutMs×6)`）并在超时后**丢弃该服务的发现客户端**（自愈，下次探测重建，不留毒化链）；③ `scan()` 每个候选端口有独立预算（`scanPortTimeoutMs`，缺省 `max(2000, probeTimeoutMs×2)`），超时端口跳过并记入 `lastScanSkipped`；④ `unity_pool_scan` 工具与 `POST /api/scan` 共用 `runPoolScan`，整体预算 `scanTimeoutMs`（默认 20s）——超时返回已完成部分 + `timedOut:true`，**保证任何情况下都在预算内返回**；⑤ `probe()` 改 `Promise.allSettled`（单服务异常不拖垮整池、不产生 unhandled rejection）；⑥ 探活 GET 显式取消响应体（不占连接）、发现客户端按 URL 变化重建。smoke 扩到 229 项全过（新增 9 项回归：挂起服务 probe 不挂/标记超时/丢弃客户端、挂起端口 scan 跳过、首请求挂起后自愈、工具级预算内返回 + skippedPorts）。
 
