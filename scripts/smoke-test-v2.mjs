@@ -36,6 +36,9 @@ function makeMcpServer(instances, opts = {}) {
   let listCalls = 0
   let nextSession = 1
   let offlineFlag = false      // setOffline(true)：模拟服务离线（所有请求 503）
+  // v0.5.5 回归：模拟「只回响应头、响应体永不结束」的服务（SSE 保活 / 非 MCP 服务）。
+  // opts.hangBody=true → 所有 POST 都挂起；= N → 前 N 个 POST 挂起（用于验证串行链自愈）。
+  let hangLeft = opts.hangBody === true ? Infinity : (Number(opts.hangBody) > 0 ? Number(opts.hangBody) : 0)
   let failInstancesFlag = false // setFailInstances(true)：模拟实例发现失败（resources/read 报错）
   let failToolsListFlag = opts.failToolsList === true // setFailToolsList(v)：运行时切换 tools/list 失败
   // 选中项返回（真实场景：场景内 GameObject 的 InstanceID 为负数——插件解析必须支持负号）
@@ -62,6 +65,15 @@ function makeMcpServer(instances, opts = {}) {
       // GET 探活（无 body）：返回空 JSON，fetch 视为服务在线
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end('{}')
+      return
+    }
+    // v0.5.5 回归：只发响应头、响应体永不结束（永不 res.end()）。
+    // 历史故障：插件在 fetch 拿到响应头后就 clearTimeout → res.text() 永久挂起 →
+    // 该 client 的串行链被一个永不 settle 的任务占住 → unity_pool_scan 永远「运行中」。
+    if (hangLeft > 0) {
+      hangLeft--
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(': keep-alive\n\n')
       return
     }
     const sid = req.headers['mcp-session-id'] || null
@@ -1392,6 +1404,106 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
     poolLegacy.stop()
     fsp.rm(legacyFile, { force: true }).catch(() => {})
   }
+}
+
+// ---------- v0.5.5 回归：unity_pool_scan 卡死（响应体永不结束 → 串行链毒化）----------
+{
+  // 1) 挂起服务：GET 探活正常，POST 只回响应头、响应体永不结束
+  const sHang = makeMcpServer([{ id: 'Hang@eeee5555', name: 'Hang', hash: 'eeee5555' }], { hangBody: true })
+  await sHang.listen()
+
+  const poolHang = createPool(ctx, {
+    services: [{ id: 'HANG', name: '挂起服务', url: 'http://127.0.0.1:' + sHang.port() + '/mcp' }],
+    dataFile: dataFile + '.hang',
+    probeIntervalMs: 60000,
+    probeTimeoutMs: 800,
+    scanPorts: [],
+  })
+  const tProbe = Date.now()
+  await poolHang.probe()
+  const probeMs = Date.now() - tProbe
+  const svcHang = poolHang.serviceById('HANG')
+  check('★ 挂起服务：probe 在请求超时内返回（不再永久挂起）', probeMs < 4000, probeMs + 'ms')
+  check('★ 挂起服务：标记实例发现失败并附超时原因',
+    svcHang.instancesValid === false && /timeout|超时/i.test(String(svcHang.lastError)), JSON.stringify(svcHang.lastError))
+  check('★ 挂起服务：探测超时后丢弃发现客户端（下次重建，不留在毒化链上）', poolHang.discoveryClients.has('HANG') === false)
+  poolHang.stop()
+
+  // 2) 扫描候选端口命中挂起服务：跳过该端口 + 记入 lastScanSkipped，不拖死整次扫描
+  const poolScanHang = createPool(ctx, {
+    services: [{ id: 'DEAD', name: '离线服务', url: 'http://127.0.0.1:1/mcp' }],
+    dataFile: dataFile + '.hangscan',
+    probeIntervalMs: 60000,
+    probeTimeoutMs: 800,
+    scanPorts: [sHang.port()],
+    scanPortTimeoutMs: 1200,
+    scanTimeoutMs: 5000,
+  })
+  const tScan = Date.now()
+  const foundHang = await poolScanHang.scan()
+  const scanMs = Date.now() - tScan
+  check('★ 挂起端口：scan 在单端口预算内返回', scanMs < 4000, scanMs + 'ms')
+  check('★ 挂起端口：未并入池 + 记入 lastScanSkipped',
+    foundHang.length === 0 && Array.isArray(poolScanHang.lastScanSkipped) && poolScanHang.lastScanSkipped.some(s => s.port === sHang.port()),
+    JSON.stringify(poolScanHang.lastScanSkipped))
+  poolScanHang.stop()
+
+  // 3) 首个请求挂起 → 本次探测失败；下一次探测重建客户端后恢复（串行链未被永久毒化）
+  const sHangFirst = makeMcpServer([{ id: 'First@ffff6666', name: 'First', hash: 'ffff6666' }], { hangBody: 1 })
+  await sHangFirst.listen()
+  const poolFirst = createPool(ctx, {
+    services: [{ id: 'HF', name: '先挂后好', url: 'http://127.0.0.1:' + sHangFirst.port() + '/mcp' }],
+    dataFile: dataFile + '.hangfirst',
+    probeIntervalMs: 60000,
+    probeTimeoutMs: 800,
+    scanPorts: [],
+  })
+  await poolFirst.probe()
+  check('★ 首请求挂起：本次探测标记失败（带超时原因）',
+    poolFirst.serviceById('HF').instancesValid === false, JSON.stringify(poolFirst.serviceById('HF').lastError))
+  await poolFirst.probe()
+  const svcFirst = poolFirst.serviceById('HF')
+  check('★ 自愈：下一次探测重建客户端后成功发现实例（串行链未被毒化）',
+    svcFirst.instancesValid === true && svcFirst.instances.length === 1,
+    JSON.stringify({ valid: svcFirst.instancesValid, n: svcFirst.instances.length, err: svcFirst.lastError }))
+  poolFirst.stop()
+
+  // 4) 工具级：unity_pool_scan 必须在总预算内返回（不是永久「运行中」）
+  const sHang2 = makeMcpServer([], { hangBody: true })
+  await sHang2.listen()
+  const registeredHang = []
+  const fakeCtxHang = {
+    logger: { info() {}, warn() {}, error() {} },
+    effect(fn) { fn(); return () => {} },
+    inject(services, fn) { fn({ effect: fakeCtxHang.effect, webServer: fakeCtxHang.webServer }) },
+    tools: { register(def) { registeredHang.push(def); return () => {} } },
+    systemPrompt: { section() {}, context() {} },
+    webServer: { register() { return () => {} } },
+  }
+  apply(fakeCtxHang, {
+    services: [{ id: 'HANG', name: '挂起服务', url: 'http://127.0.0.1:' + sHang.port() + '/mcp' }],
+    dataFile: dataFile + '.hangtool',
+    probeIntervalMs: 60000,
+    probeTimeoutMs: 800,
+    scanPorts: [sHang2.port()],
+    scanPortTimeoutMs: 1200,
+    scanTimeoutMs: 4000,
+  })
+  const scanToolHang = registeredHang.find(t => t.name === 'unity_pool_scan')
+  const tTool = Date.now()
+  const toolRes = await scanToolHang.execute({}, { agent: { id: 'sess-HANG' } })
+  const toolMs = Date.now() - tTool
+  check('★ 工具 unity_pool_scan：挂起服务下仍在预算内返回', toolMs < 6000, toolMs + 'ms')
+  check('★ 工具 unity_pool_scan：返回含 skippedPorts / view（不是卡住无输出）',
+    Boolean(toolRes) && Array.isArray(toolRes.view.services) && Array.isArray(toolRes.skippedPorts) && toolRes.skippedPorts.length === 1,
+    JSON.stringify({ skipped: toolRes && toolRes.skippedPorts, timedOut: toolRes && toolRes.timedOut }).slice(0, 300))
+
+  sHang.server.closeAllConnections?.(); sHang2.server.closeAllConnections?.(); sHangFirst.server.closeAllConnections?.()
+  sHang.close(); sHang2.close(); sHangFirst.close()
+  fsp.rm(dataFile + '.hang', { force: true }).catch(() => {})
+  fsp.rm(dataFile + '.hangscan', { force: true }).catch(() => {})
+  fsp.rm(dataFile + '.hangfirst', { force: true }).catch(() => {})
+  fsp.rm(dataFile + '.hangtool', { force: true }).catch(() => {})
 }
 
 poolState.stop(); poolTiny.stop(); poolNoSnap.stop()

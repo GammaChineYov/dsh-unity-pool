@@ -80,6 +80,8 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     probeIntervalMs: 8000     # 探活+实例发现间隔（ms）
     probeTimeoutMs: 3000      # 单次 MCP 请求超时（ms）
     scanPorts: [8080, 8081, 8082, 8083, 8084, 8090]   # unity_pool_scan 自动扫描的端口段
+    scanPortTimeoutMs: 0      # 单个候选端口（握手+实例发现）总时长上限（ms；0/缺省 = max(2000, probeTimeoutMs×2)）：端口上挂着「只回响应头不收尾」的服务时跳过该端口而非卡死
+    scanTimeoutMs: 20000      # unity_pool_scan 工具/接口总时长上限（ms）：超时返回已完成部分 + timedOut 标记，绝不出现「工具调用一直运行中」
     autoAssign: true          # 未指定实例时自动分配未被其他会话锁定的实例
     enforceExclusive: true    # 仅在显式传 force=false 时生效（并行开发是正常用法，force 默认 true，默认不拒绝并行绑定）
     connectHint: '调用 unity_mcp(tool=..., params=...) 代理 MCP 工具调用'
@@ -126,7 +128,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 | 工具 | 作用 |
 |------|------|
 | `unity_pool_status` | 服务池 → 每服务实例列表（Name@hash/hash/是否本会话激活 + instancesValid/offlineStreak）+ 本会话锁定 + 最近归档自动解绑 lastAutoUnbind；**已绑定时附带该服务最新工具名速查 `tools: {count, names}`** |
-| `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务 |
+| `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务；**全程有预算（v0.5.5）**——单端口 `scanPortTimeoutMs`、整体 `scanTimeoutMs`（默认 20s），超时的端口记入返回的 `skippedPorts`，整体超时返回 `timedOut:true` + 已完成部分（不会永远「运行中」） |
 | `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**每次绑定都返回该服务最新 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**（同服务重复绑定也重拉保持新鲜；拉取失败回退上次缓存并附 `toolsError`，不阻断绑定）；**绑定后该服务工具自动注册为原生工具 `umcp_<工具名>`（v0.5.0）**——模型上下文直接可见全部工具名/描述/参数并原生调用（等价 `unity_mcp` 转发，未绑定会话调用报「未锁定目标实例」）；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
 | `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**工具名不存在时错误信息附带当前可用工具名列表（含相似工具名提示）**，选正确名称重试即可；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃）；**调用前后各检查一次 Console（v0.5.2）**——期间新增的错误（编译错误/运行时报错）随本次结果返回（结构化 `errorWatch` + 文本附在 `text` 末尾，默认前 5 条、单条 2000 字符，同一批只返回一次） |
 | `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话（同时清掉本会话的错误携带游标，重绑后重建基线） |
@@ -148,10 +150,12 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 207 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 229 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）+ v0.5.5 扫描卡死回归（响应体永不结束的挂起服务/挂起端口/串行链自愈/工具级预算内返回）（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
+
+- `0.5.5` **修复 `unity_pool_scan` 卡死（工具调用永远「运行中」）**：根因在 MCP 客户端——`_request` 在 `fetch` 拿到响应头后就 `clearTimeout`，而超时器本该覆盖到响应体读完；当某个端点只回响应头、响应体永不结束（streamable HTTP 的 SSE 保活/长连接、或端口上挂着非 MCP 服务）时 `res.text()` 永久挂起，该 client 的**串行链被一个永不 settle 的任务占住**，于是 `listInstances`/`probe`/`unity_pool_scan` 之后的所有调用全部排队等死（`unity_pool_scan` 就是「一直运行中」）。修复：① `_request` 的 AbortController 计时器**活到响应体读完**（`finally` 统一清理），超时错误区分「请求失败/响应体未结束」并报真实预算；② `probeService` 增加总预算（`max(5000, probeTimeoutMs×6)`）并在超时后**丢弃该服务的发现客户端**（自愈，下次探测重建，不留毒化链）；③ `scan()` 每个候选端口有独立预算（`scanPortTimeoutMs`，缺省 `max(2000, probeTimeoutMs×2)`），超时端口跳过并记入 `lastScanSkipped`；④ `unity_pool_scan` 工具与 `POST /api/scan` 共用 `runPoolScan`，整体预算 `scanTimeoutMs`（默认 20s）——超时返回已完成部分 + `timedOut:true`，**保证任何情况下都在预算内返回**；⑤ `probe()` 改 `Promise.allSettled`（单服务异常不拖垮整池、不产生 unhandled rejection）；⑥ 探活 GET 显式取消响应体（不占连接）、发现客户端按 URL 变化重建。smoke 扩到 229 项全过（新增 9 项回归：挂起服务 probe 不挂/标记超时/丢弃客户端、挂起端口 scan 跳过、首请求挂起后自愈、工具级预算内返回 + skippedPorts）。
 
 - `0.5.4` **新增 Console 错误状态携带开关**：新增第 8 项子开关 `stateConsoleError`（面板/输入框 dock 均加「Console 错误 / Console错」项，默认关）——状态携带时只采集 `read_console types=['error']` 的 **error 级**条目（复用 `stateConsoleCount`/`stateConsoleMaxChars` 与最新优先截断），让注入的 Console 一眼看到错误而非全文噪音；为 `stateConsoleAll`/`stateConsoleSelected` 之外的独立开关，互不影响。（2026-09-02 修正：Unity「缺脚本/缺 Behaviour」消息虽被 mcp-for-unity 标为 Error，但 Console 里是黄色警告，已按 Unity 固定文案 `UNITY_MISSING_SCRIPT_RE` 剔除，只保留真 error 级。）
 - `0.5.4` **修复 Console 状态携带「只见旧不见新」**：状态携带的 Console 全文（`stateConsoleAll`）此前把 `read_console` 返回的**旧→新**条目 join 后按 `slice(0, maxChars)` 保留**开头（最旧）**——一旦最近 N 条超出 `stateConsoleMaxChars`（默认 6000；长的 JSON 请求/响应日志极易超），**最新日志被整段裁掉**。于是注入的 Console 既不是全程日志（`count` 只回最近 N 条）也不是最新日志——「不是新的也不是旧的」。新增 Console 专用 `UnityPool.truncateConsole(entries, maxChars, label)`：按行从**尾部（最新）**向前累加，尽量整条保留；单条超预算时掐该条尾部；前缀标注「…[Console 超预算：显示最新 X 条，省略 Y 条更早日志（原 N 条 / M 字符）]」。`consoleAll` 改为捕获条目数组后用 `truncateConsole`（`truncate` 通用助手用于选中项/序列化字段，保持不变）。
