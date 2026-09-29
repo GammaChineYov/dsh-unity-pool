@@ -157,6 +157,11 @@ node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 240 项：m
 
 ## 变更日志
 
+- `0.5.7` **修复「同一 MCP 服务上并存两个 Unity 实例时，本会话绑定失效、所有 MCP 调用被拦」**（2026-09-16 实测复现）。根因：实例选择此前**只**依赖官方 session-scoped state（`set_active_instance` 写入、按 `Mcp-Session-Id` 存），而插件仅在本地镜像 `client.activeInstance` ≠ 绑定实例时才去激活；服务端 MCP 会话一旦被重建（服务重启 / 会话被清理 / 编辑器域重载），本地镜像仍是陈旧的「已激活」→ 跳过激活 → 在**没有选择**的新会话上直发 `tools/call`。该服务上只有 1 个实例时官方会自动选中（把问题掩盖住），一旦并存 2 个实例就被官方守卫拦死：`Multiple Unity instances are connected. Call set_active_instance … Available: [...]`。修复三处：
+  - **① 每调用路由（主修复）**：每次 `tools/call` 都携带 `unity_instance=<绑定实例>`，由官方 `UnityInstanceMiddleware` 在**本次调用**上直接解析实例，不依赖会丢失的 session state（实测：全新 MCP 会话、不做任何 `set_active_instance`，带该参数也能正确路由；`read_console`/`manage_editor`/`batch_execute` 等均接受）。老服务端不认识该参数时**自动降级**为只用会话状态（判定后只降级一次，不影响旧部署）。
+  - **② 本地镜像与 MCP 会话同生共死**：`activeInstance` 改为「镜像值 + 记下它属于哪个 session」，会话被重置/失效即作废（`sessionInvalid` 时显式清空），不再出现「本地以为已激活、服务端其实没有」。
+  - **③ 不再伪造成功 + 不静默改投**：`unity_mcp(tool='set_active_instance')` 此前**短路返回** `active instance set to X`（让"选择没生效"看起来像成功，本次缺陷最误导人的一环），现在**真转发、真结果**；遇到官方实例选择守卫时显式重建会话内选择并重试一次，仍失败则返回 `success:false` + `【路由未生效】` 说明（明确「本次调用未在任何实例上执行」，绝不改投其它实例）。附带：绑定结果不再无声吞掉激活失败（新增 `activateError`）；陈旧绑定（服务不在池中）给出可读原因；绑定到扫描发现的服务（`scan-N`）不再在插件热重载后被静默丢弃。
+  - 验证：`scripts/smoke-test-v2.mjs` **240 项全过**（0 失败，含单实例/多实例/绑定/排他/状态携带全量回归）；真机双实例（P2 `2022.3.62f2c1` + P4 `2022.3.62f3c1` 同挂 8090）实测：① `read_console` 正常返回；② 绑 P4 后 `execute_code` 回读 `2022.3.62f3c1 | G:/Project_AAA/WuLing/_P4_总装车间E线/Assets`，绑回 P2 得 `2022.3.62f2c1 | …/_P2_前后挡A岛/Assets`；③ 故意 `DELETE /mcp` 杀掉本会话的服务端 MCP 会话后，下一次调用**自动恢复**（修复前该状态下每次调用都返回 `instance_selection_required`）且不再伴随 10s 忙等待；④ 指定不存在的实例 → `success:false` + `Instance '…' not found. Available: […]…`，不静默改投。
 - `0.5.6` **修复「新会话绑定后开启状态、发消息没注入上下文」**：根因是注入路径的同步/异步错配——`systemPrompt.context.text` 是**同步**函数（harness 契约：`text: string | ((context) => string)`），只能读已有缓存；而状态采集是**异步**的（MCP 往返 1~3s）。新会话 / 插件热重载 / 刚打开开关时缓存为空 → 首回合求值拿到空串，且旧代码还把空串写进「按回合缓存」→ **整个回合（含后续 step）都没有状态块**。观察到的现象就是「开了状态、发消息，上下文里没有 Unity 状态」。修复：
   - ① 新增 `system-prompt/assemble` 装配瀑布监听（唯一可 await 的装配钩子）：条目为空且本会话启用状态携带时，**有界等待一次采集**（`stateFirstTurnWaitMs`，默认 4s；冷却 `stateCollectCooldownMs`，默认 10s）后就地替换该 context 条目 → 首条消息即带状态；缓存已热时零开销（直接返回）。
   - ② `collectState` 防重入改为**返回同一个在飞 Promise**（原来返回 null）：消息/开关触发的采集正在跑时，装配阶段能等它结束，而不是误判「没在采」。
