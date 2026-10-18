@@ -107,8 +107,8 @@ function launchOf() {
     enabled: true,
     waitReadyMs: 120000,
     projects: [
-      { name: 'ProjX', path: 'C:/Proj/ProjX', version: '2022.3.62f3c1', exists: true, valid: true, hasMcpPackage: true, running: launchRunning },
-      { name: 'ProjY', path: 'C:/Proj/ProjY', version: '2022.3.62f3c1', exists: true, valid: true, hasMcpPackage: false, running: false },
+      { name: 'ProjX', path: 'C:/Proj/ProjX', version: '2022.3.62f3c1', exists: true, valid: true, hasMcpPackage: true, mcpSource: 'packages', running: launchRunning },
+      { name: 'ProjY', path: 'C:/Proj/ProjY', version: '2022.3.62f3c1', exists: true, valid: true, hasMcpPackage: false, mcpSource: null, running: false },
     ],
     launches: [],
   }
@@ -395,19 +395,20 @@ check('★ dock 解绑后入口回到「绑定 Unity」', Boolean(bindBtn) && co
 const dockScanBtn = buttons(dTree).find(b => b.props.children === '扫描')
 check('dock 浮窗提供「扫描」（实例不在列表时可重扫）', Boolean(dockScanBtn), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
 
-// ---------- v0.5.8 启动 Unity 入口 ----------
-const launchChip = buttons(dTree).find(b => b.props.children === '启动 Unity')
-check('★ dock 渲染「启动 Unity」入口', Boolean(launchChip), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
-const projLaunchBtns = buttons(dTree).filter(b => b.props.children === '启动')
-check('dock 浮窗列出工程清单（2 个「启动」按钮）', projLaunchBtns.length === 2, 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+// ---------- v0.5.8 启动 Unity 入口（用户要求放在右上角胶囊弹窗，不放 dock） ----------
+const utFinal = await settle(ut.Comp, props, 2)
+const panelLaunchBtns = buttons(utFinal).filter(b => b.props.children === '启动')
+check('★ 右上角胶囊弹窗列出工程清单（2 个「启动」按钮）', panelLaunchBtns.length === 2, 'buttons=' + buttons(utFinal).map(b => b.props.children).join(','))
+const dockFinal = await settle(dock.Comp, props, 2)
+check('★ 输入条 dock 不再有「启动 Unity」入口（已移到胶囊弹窗）', !buttons(dockFinal).some(b => b.props.children === '启动 Unity'), 'buttons=' + buttons(dockFinal).map(b => b.props.children).join(','))
 const beforeLaunch = fetched.length
 lastLaunchBody = null
-projLaunchBtns[0].props.onClick()
+panelLaunchBtns[0].props.onClick()
 await new Promise(r => setTimeout(r, 0))
-check('★ 启动 Unity：POST /api/launch 带工程名', fetched.slice(beforeLaunch).some(u => u.includes('/api/launch')) && lastLaunchBody && lastLaunchBody.project === 'ProjX', JSON.stringify(lastLaunchBody))
-dTree = await settle(dock.Comp, props, 2)
-const noteNodes = collect(dTree, n => n.type === 'div' && typeof n.props.children === 'string' && /已启动并绑定/.test(n.props.children), [])
-check('★ 启动后就绪提示「已启动并绑定」', noteNodes.length === 1, 'notes=' + collect(dTree, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('启动') >= 0).join('|'))
+check('★ 胶囊弹窗点「启动」：POST /api/launch 带工程名', fetched.slice(beforeLaunch).some(u => u.includes('/api/launch')) && lastLaunchBody && lastLaunchBody.project === 'ProjX', JSON.stringify(lastLaunchBody))
+const utAfterLaunch = await settle(ut.Comp, props, 2)
+const noteNodes = collect(utAfterLaunch, n => n.type === 'div' && typeof n.props.children === 'string' && /已启动并绑定/.test(n.props.children), [])
+check('★ 启动后就绪提示「已启动并绑定」', noteNodes.length === 1, 'notes=' + collect(utAfterLaunch, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('启动') >= 0).join('|'))
 
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILED: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
