@@ -95,10 +95,24 @@ const STATE_ON = { enabled: true, switches: { stateEnabled: true, stateGameScree
 let serverState = JSON.parse(JSON.stringify(STATE_OFF))
 const fetched = []
 let lastBindBody = null // 最近一次 /api/bind 请求体（断言不再发 force=false）
+let lastLaunchBody = null // 最近一次 /api/launch 请求体（v0.5.8）
 let staleStatus = false // 下一次 /api/status 返回"请求发出时"的旧快照（延迟 30ms），模拟轮询响应晚于用户切换
 // viewOf.binding 可变：模拟宿主侧绑定/解绑（面板锁定按钮 / agent 工具 / 其它标签页）
 // ProjY 模拟被其它会话占用：普通 bind 409，force 才成功
 const viewOf = { binding: { serviceId: 'S1', instance: { name: 'ProjX', id: 'ProjX@aaaa1111' } }, state: () => JSON.parse(JSON.stringify(serverState)) }
+// v0.5.8：启动 Unity 入口的工程清单（dock 浮窗上部）
+let launchRunning = false
+function launchOf() {
+  return {
+    enabled: true,
+    waitReadyMs: 120000,
+    projects: [
+      { name: 'ProjX', path: 'C:/Proj/ProjX', version: '2022.3.62f3c1', exists: true, valid: true, hasMcpPackage: true, running: launchRunning },
+      { name: 'ProjY', path: 'C:/Proj/ProjY', version: '2022.3.62f3c1', exists: true, valid: true, hasMcpPackage: false, running: false },
+    ],
+    launches: [],
+  }
+}
 function servicesOf() {
   const bi = viewOf.binding && viewOf.binding.instance && viewOf.binding.instance.id
   return [{
@@ -119,7 +133,7 @@ function mockFetch(url, opts) {
     } else {
       serverState.switches[body.key] = body.value
     }
-    const v = { sessionId: MOCK_SESSION, state: JSON.parse(JSON.stringify(serverState)), view: { binding: viewOf.binding, services: servicesOf() } }
+    const v = { sessionId: MOCK_SESSION, state: JSON.parse(JSON.stringify(serverState)), view: { binding: viewOf.binding, services: servicesOf(), launch: launchOf() } }
     return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/bind')) {
@@ -131,26 +145,37 @@ function mockFetch(url, opts) {
       return Promise.resolve({ json: () => Promise.resolve({ ok: false, error: { message: '实例 [ProjY@oooo2222] 正被其他会话并行使用（enforceExclusive 默认开启；并行开发同一实例属正常用法）。如需同时绑定可传 force=true' } }) })
     }
     viewOf.binding = { serviceId: 'S1', instance: { name: inst.startsWith('ProjY') ? 'ProjY' : 'ProjX', id: inst } }
-    const v = { sessionId: MOCK_SESSION, view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)) } }
+    const v = { sessionId: MOCK_SESSION, view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() } }
     return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
+  }
+  if (typeof url === 'string' && url.includes('/unity-pool/api/launch')) {
+    const body = JSON.parse((opts && opts.body) || '{}')
+    lastLaunchBody = body
+    const proj = String(body.project || 'ProjX')
+    return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: {
+      sessionId: MOCK_SESSION, launched: true, pid: 4242, ready: true,
+      instance: { name: proj, id: proj + '@aaaa1111' },
+      binding: { toolsCount: 12 },
+      view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() },
+    } }) })
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/unbind')) {
     viewOf.binding = null
-    const v = { sessionId: MOCK_SESSION, view: { binding: null, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)) } }
+    const v = { sessionId: MOCK_SESSION, view: { binding: null, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() } }
     return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/state')) {
     // 与真实宿主一致：value = {sessionId, cache, view}（state 在 view.state，无顶层 state）
-    const v = { sessionId: MOCK_SESSION, cache: null, view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)) } }
+    const v = { sessionId: MOCK_SESSION, cache: null, view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() } }
     return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/status') && staleStatus) {
     staleStatus = false
     const old = JSON.parse(JSON.stringify(STATE_OFF)) // 请求发出时的旧状态快照
-    return new Promise(res => setTimeout(() => res({ json: () => Promise.resolve({ ok: true, value: { sessionId: MOCK_SESSION, binding: viewOf.binding, services: servicesOf(), state: old } }) }), 30))
+    return new Promise(res => setTimeout(() => res({ json: () => Promise.resolve({ ok: true, value: { sessionId: MOCK_SESSION, binding: viewOf.binding, services: servicesOf(), state: old, launch: launchOf() } }) }), 30))
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/status')) {
-    const v = { sessionId: MOCK_SESSION, binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)) }
+    const v = { sessionId: MOCK_SESSION, binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() }
     return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
   }
   return Promise.resolve({ json: () => Promise.resolve({ ok: false, error: { message: 'no mock for ' + url } }) })
@@ -196,7 +221,7 @@ check('面板 chip 可点击', Boolean(chip), 'clickables=' + clickables(utTree)
 chip.props.onClick()
 utTree = await settle(ut.Comp, props)
 const panelInputs = inputs(utTree)
-check('面板打开后渲染出开关区（8 个 input：master + 7 子项）', panelInputs.length === 8, 'inputs=' + panelInputs.length)
+check('面板打开后渲染出开关区（9 个 input：master + 8 子项）', panelInputs.length === 9, 'inputs=' + panelInputs.length)
 check('面板总开关初始为关（与 dock 同源）', panelInputs[0].props.checked === false, JSON.stringify(panelInputs[0] && panelInputs[0].props))
 
 // ---------- 核心：一处切换 → 两处即时同步 ----------
@@ -209,7 +234,7 @@ const dockTree2 = await settle(dock.Comp, props)
 check('dock 自身总开关变开', inputs(dockTree2)[0].props.checked === true, JSON.stringify(inputs(dockTree2)[0] && inputs(dockTree2)[0].props))
 const utTree2 = await settle(ut.Comp, props)
 const ut2 = inputs(utTree2)
-check('★ 面板总开关即时同步为开（无需轮询/重开面板）', ut2.length === 8 && ut2[0].props.checked === true, JSON.stringify(ut2[0] && ut2[0].props))
+check('★ 面板总开关即时同步为开（无需轮询/重开面板）', ut2.length === 9 && ut2[0].props.checked === true, JSON.stringify(ut2[0] && ut2[0].props))
 const dockTree2Game = buttons(dockTree2).find(b => b.props && b.props.title && /Game 截图/.test(String(b.props.title || '')))
 check('★ 面板 Game 截图子开关与 dock 芯片一致（服务端未开 → 两边都关）', ut2[1].props.checked === false && /（关）/.test(dockTree2Game.props.title || ''), JSON.stringify(ut2[1] && ut2[1].props))
 
@@ -322,7 +347,7 @@ await new Promise(r => setTimeout(r, 60)) // 等旧快照响应到达并被 refr
 const dAfter = await settle(dock.Comp, props, 1)
 check('★ 旧轮询快照晚到不覆盖新切换：dock 总开关保持开', inputs(dAfter)[0].props.checked === true, JSON.stringify(inputs(dAfter)[0] && inputs(dAfter)[0].props))
 const utAfter = await settle(ut.Comp, props, 1)
-check('★ 旧轮询快照晚到不覆盖新切换：面板总开关保持开', inputs(utAfter).length === 8 && inputs(utAfter)[0].props.checked === true, JSON.stringify(inputs(utAfter)[0] && inputs(utAfter)[0].props))
+check('★ 旧轮询快照晚到不覆盖新切换：面板总开关保持开', inputs(utAfter).length === 9 && inputs(utAfter)[0].props.checked === true, JSON.stringify(inputs(utAfter)[0] && inputs(utAfter)[0].props))
 
 
 // ---------- v0.5.3：dock 内绑定入口（新会话没有会话头部槽 → 头部胶囊不渲染，绑定入口必须在 dock） ----------
@@ -369,6 +394,20 @@ bindBtn = dockBindBtnOf(dTree)
 check('★ dock 解绑后入口回到「绑定 Unity」', Boolean(bindBtn) && collect(bindBtn, n => n.type === 'span' && n.props.children === '绑定 Unity', []).length === 1, bindBtn && JSON.stringify(collect(bindBtn, n => n.type === 'span', []).map(s => s.props.children)))
 const dockScanBtn = buttons(dTree).find(b => b.props.children === '扫描')
 check('dock 浮窗提供「扫描」（实例不在列表时可重扫）', Boolean(dockScanBtn), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+
+// ---------- v0.5.8 启动 Unity 入口 ----------
+const launchChip = buttons(dTree).find(b => b.props.children === '启动 Unity')
+check('★ dock 渲染「启动 Unity」入口', Boolean(launchChip), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+const projLaunchBtns = buttons(dTree).filter(b => b.props.children === '启动')
+check('dock 浮窗列出工程清单（2 个「启动」按钮）', projLaunchBtns.length === 2, 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+const beforeLaunch = fetched.length
+lastLaunchBody = null
+projLaunchBtns[0].props.onClick()
+await new Promise(r => setTimeout(r, 0))
+check('★ 启动 Unity：POST /api/launch 带工程名', fetched.slice(beforeLaunch).some(u => u.includes('/api/launch')) && lastLaunchBody && lastLaunchBody.project === 'ProjX', JSON.stringify(lastLaunchBody))
+dTree = await settle(dock.Comp, props, 2)
+const noteNodes = collect(dTree, n => n.type === 'div' && typeof n.props.children === 'string' && /已启动并绑定/.test(n.props.children), [])
+check('★ 启动后就绪提示「已启动并绑定」', noteNodes.length === 1, 'notes=' + collect(dTree, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('启动') >= 0).join('|'))
 
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILED: ' + failures)
 process.exit(failures === 0 ? 0 : 1)

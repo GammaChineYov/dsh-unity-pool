@@ -429,6 +429,128 @@ const unk2 = await poolU.proxyMcp('sess-U', 'manage_scen', {})
 check('未知工具：相似工具提示命中（manage_scen → manage_scene）', unk2.success === false && /相似工具：manage_scene/.test(unk2.text), unk2.text.slice(0, 300))
 poolU.stop()
 
+// ---------- v0.5.8 启动 Unity 编辑器 ----------
+// 用一个临时「工程 + 编辑器安装目录」验证：路径/版本解析、重复打开保护、启动参数、
+// 等待实例出现、自动绑定、未就绪路径、版本不匹配、allowAnyProject、MCP 包标记。
+const launchRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'unity-pool-launch-'))
+const launchProj = path.join(launchRoot, 'ProjLaunch')
+await fsp.mkdir(path.join(launchProj, 'Assets'), { recursive: true })
+await fsp.mkdir(path.join(launchProj, 'ProjectSettings'), { recursive: true })
+await fsp.mkdir(path.join(launchProj, 'Packages'), { recursive: true })
+await fsp.writeFile(path.join(launchProj, 'ProjectSettings', 'ProjectVersion.txt'), 'm_EditorVersion: 2022.3.62f3c1\n')
+await fsp.writeFile(path.join(launchProj, 'Packages', 'manifest.json'), JSON.stringify({ dependencies: { 'com.coplaydev.unity-mcp': 'https://example.invalid/unity-mcp.git' } }))
+const editorRoot = path.join(launchRoot, 'Editors')
+const fakeUnityDir = path.join(editorRoot, '2022.3.62f3c1', 'Editor')
+await fsp.mkdir(fakeUnityDir, { recursive: true })
+await fsp.writeFile(path.join(fakeUnityDir, 'Unity.exe'), 'stub')
+const launchLogDir = path.join(launchRoot, 'logs')
+
+const sL = makeMcpServer([]) // 启动前没有实例
+await sL.listen()
+const launchCtx = { logger: { info() {}, warn() {}, error() {} } }
+const poolL = createPool(launchCtx, {
+  services: [{ id: 'SL', name: '启动服务', url: 'http://127.0.0.1:' + sL.port() + '/mcp' }],
+  dataFile: dataFile + '.launch',
+  probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
+  projects: [{ name: 'ProjLaunch', path: launchProj }],
+  editorRoots: [editorRoot],
+  launchLogDir,
+  launchWaitReadyMs: 4000,
+  launchPollIntervalMs: 100,
+})
+let spawnedL = null
+poolL._spawnEditor = (exe, args) => { spawnedL = { exe, args }; return { pid: 424242 } }
+poolL.isPidAlive = (pid) => Number(pid) === 424242
+// 编辑器「启动」后 250ms 让 mock 服务出现该工程实例（实例名 = 工程名）
+setTimeout(() => { sL.instancesRef.push({ id: 'ProjLaunch@deadbeef', name: 'ProjLaunch', hash: 'deadbeef' }) }, 250)
+const rLaunch = await poolL.launch('sess-LAUNCH', { project: 'ProjLaunch' })
+check('launch：解析已装编辑器版本并启动', rLaunch.launched === true && rLaunch.pid === 424242 && rLaunch.editor.version === '2022.3.62f3c1' && rLaunch.editor.mismatch === false, JSON.stringify({ e: rLaunch.editor, pid: rLaunch.pid }).slice(0, 300))
+check('launch：命令行带 -projectPath / -logFile', spawnedL && spawnedL.args[0] === '-projectPath' && spawnedL.args[1] === launchProj && spawnedL.args.includes('-logFile'), JSON.stringify(spawnedL && spawnedL.args).slice(0, 300))
+check('launch：实例出现后自动绑定本会话', rLaunch.ready === true && rLaunch.instance && rLaunch.instance.id === 'ProjLaunch@deadbeef' && rLaunch.binding && rLaunch.binding.instanceId === 'ProjLaunch@deadbeef', JSON.stringify(rLaunch.instance))
+check('launch：view.launch 带工程清单与 MCP 包标记', poolL.view('sess-LAUNCH').launch.projects[0].name === 'ProjLaunch' && poolL.view('sess-LAUNCH').launch.projects[0].hasMcpPackage === true, JSON.stringify(poolL.view('sess-LAUNCH').launch.projects).slice(0, 300))
+const rAgain = await poolL.launch('sess-LAUNCH', { project: 'ProjLaunch' })
+check('launch：工程已在运行时不再重复启动', rAgain.alreadyRunning === true && rAgain.launched === false && rAgain.ready === true, JSON.stringify(rAgain).slice(0, 300))
+
+// 未就绪路径：实例一直不出现 → 超时返回 ready:false + 后续指引
+const sL2 = makeMcpServer([])
+await sL2.listen()
+const poolL2 = createPool(launchCtx, {
+  services: [{ id: 'SL2', name: '启动服务2', url: 'http://127.0.0.1:' + sL2.port() + '/mcp' }],
+  dataFile: dataFile + '.launch2',
+  probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
+  editorRoots: [editorRoot], launchLogDir, launchWaitReadyMs: 700, launchPollIntervalMs: 100,
+})
+poolL2._spawnEditor = () => ({ pid: 434343 })
+poolL2.isPidAlive = () => true
+const rNotReady = await poolL2.launch('sess-L2', { projectPath: launchProj, waitMs: 700 })
+check('launch：未就绪时 ready:false 且有后续指引', rNotReady.launched === true && rNotReady.ready === false && /稍后调 unity_pool_status/.test(String(rNotReady.hint)), JSON.stringify(rNotReady).slice(0, 400))
+check('launch：未就绪的启动记录可在 view.launch 看到', poolL2.view('sess-L2').launch.launches.some(l => l.pid === 434343 && l.ready === false))
+
+// 服务离线 + services[].startCommand → launch 先拉起服务；服务仍未监听时返回 server.alive:false + 日志/提示
+const poolSrv = createPool(launchCtx, {
+  services: [{ id: 'SS', name: '服务启动', url: 'http://127.0.0.1:9/mcp', startCommand: ['fake-server', '--port', '9'] }],
+  dataFile: dataFile + '.srv',
+  probeIntervalMs: 600000, probeTimeoutMs: 200, scanPorts: [],
+  editorRoots: [editorRoot], launchLogDir, launchWaitReadyMs: 400, launchPollIntervalMs: 100, serverStartWaitMs: 400,
+})
+let spawnedSrv = null
+poolSrv._spawnServer = (cmd, log) => { spawnedSrv = { cmd, log }; return { pid: 5150 } }
+poolSrv._spawnEditor = () => ({ pid: 6160 })
+poolSrv.isPidAlive = () => true
+const rSrv = await poolSrv.launch('sess-SRV', { projectPath: launchProj, waitMs: 400 })
+check('launch：服务离线时按 startCommand 拉起服务', rSrv.server && rSrv.server.started === true && spawnedSrv && spawnedSrv.cmd[0] === 'fake-server', JSON.stringify(rSrv.server))
+check('launch：服务未监听时返回 alive:false 与日志/提示', rSrv.server && rSrv.server.alive === false && /server-SS-/.test(String(rSrv.server.logFile)) && /未监听/.test(String(rSrv.server.hint)), JSON.stringify(rSrv.server).slice(0, 300))
+// 服务已在线时不再重复拉起
+const poolSrv2 = createPool(launchCtx, {
+  services: [{ id: 'SL3', name: '启动服务3', url: 'http://127.0.0.1:' + sL.port() + '/mcp', startCommand: ['should-not-run'] }],
+  dataFile: dataFile + '.srv2', probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
+  editorRoots: [editorRoot], launchLogDir,
+})
+let srv2Spawned = false
+poolSrv2._spawnServer = () => { srv2Spawned = true; return { pid: 1 } }
+poolSrv2._spawnEditor = () => ({ pid: 7171 })
+poolSrv2.isPidAlive = () => true
+const rSrv2 = await poolSrv2.launch('sess-SRV2', { projectPath: launchProj, waitReady: false })
+check('launch：服务已在线时不重复拉起服务', rSrv2.server && rSrv2.server.started === false && srv2Spawned === false, JSON.stringify(rSrv2.server))
+// 子进程 env：no_proxy 去掉 httpx 无法解析的 [::1]
+const oldNoProxy = process.env.no_proxy
+process.env.no_proxy = 'localhost,127.0.0.1,::1,[::1]'
+const cleanedEnv = poolL._childEnv()
+process.env.no_proxy = oldNoProxy
+check('launch：子进程 no_proxy 去掉 [::1]（避免 httpx InvalidURL）', cleanedEnv.no_proxy === 'localhost,127.0.0.1,::1' && !/\[/.test(cleanedEnv.no_proxy), cleanedEnv.no_proxy)
+poolSrv.stop(); poolSrv2.stop()
+
+// 版本不匹配：工程写 f2c1、本机只有 f3c1 → 默认用已装版本并标 mismatch
+const projMismatch = path.join(launchRoot, 'ProjMismatch')
+await fsp.mkdir(path.join(projMismatch, 'Assets'), { recursive: true })
+await fsp.mkdir(path.join(projMismatch, 'ProjectSettings'), { recursive: true })
+await fsp.writeFile(path.join(projMismatch, 'ProjectSettings', 'ProjectVersion.txt'), 'm_EditorVersion: 2022.3.62f2c1\n')
+const planMismatch = poolL.planLaunch({ projectPath: projMismatch })
+check('launch：版本不匹配默认用已装版本并标 mismatch', planMismatch.editor.version === '2022.3.62f3c1' && planMismatch.editor.mismatch === true, JSON.stringify(planMismatch.editor))
+const poolStrict = createPool(launchCtx, { services: [], dataFile: dataFile + '.strict', editorRoots: [editorRoot], allowVersionMismatch: false, launchLogDir })
+let strictErr = null
+try { poolStrict.planLaunch({ projectPath: projMismatch }) } catch (err) { strictErr = String(err && err.message) }
+check('launch：allowVersionMismatch=false 时版本不匹配报错', /未安装/.test(String(strictErr)), String(strictErr))
+
+// allowAnyProject=false：只允许清单内工程
+const poolNoAny = createPool(launchCtx, { services: [], dataFile: dataFile + '.noany', projects: [{ name: 'P', path: launchProj }], editorRoots: [editorRoot], allowAnyProject: false, launchLogDir })
+let anyErr = null
+try { poolNoAny.planLaunch({ projectPath: projMismatch }) } catch (err) { anyErr = String(err && err.message) }
+check('launch：allowAnyProject=false 拒绝清单外工程', /只允许启动配置清单内/.test(String(anyErr)), String(anyErr))
+
+// 非 Unity 工程 / 路径不存在
+let badErr = null
+try { poolL.planLaunch({ projectPath: path.join(launchRoot, 'not-unity') }) } catch (err) { badErr = String(err && err.message) }
+check('launch：非 Unity 工程被拒绝', /不是有效的 Unity 工程/.test(String(badErr)), String(badErr))
+
+// Temp/UnityLockfile 存在 → 视为已运行（用没有启动记录的 projMismatch）
+await fsp.mkdir(path.join(projMismatch, 'Temp'), { recursive: true })
+await fsp.writeFile(path.join(projMismatch, 'Temp', 'UnityLockfile'), '')
+check('launch：Temp/UnityLockfile 存在视为已运行', Boolean(poolL.projectRunning(projMismatch)) && poolL.projectRunning(projMismatch).source === 'lockfile')
+await fsp.rm(path.join(projMismatch, 'Temp'), { recursive: true, force: true })
+poolL.stop(); poolL2.stop(); poolStrict.stop(); poolNoAny.stop()
+sL.close(); sL2.close()
+
 // ---------- apply() 装配 ----------
 const routes = []
 const registered = []
@@ -444,7 +566,8 @@ const fakeCtx = {
   webServer: { register(route) { routes.push(route); return () => {} } },
 }
 apply(fakeCtx, { services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }], dataFile: dataFile + '.apply', probeIntervalMs: 5000 })
-check('apply：注册 6 个工具', registered.length === 6 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
+check('apply：注册 7 个工具', registered.length === 7 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_pool_launch','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
+check('apply：unity_pool_launch 描述含工程清单/排期提示', /projectPath/.test(registered.find(t => t.name === 'unity_pool_launch').description) && /台账/.test(registered.find(t => t.name === 'unity_pool_launch').description))
 check('apply：系统提示段含 unity_mcp', sections.some(s => s.name === 'unity-pool' && /unity_mcp/.test(s.text)))
 check('apply：HTTP 路由注册', routes.length === 1 && routes[0].path === '/unity-pool/api')
 
@@ -480,6 +603,18 @@ function fakeReq(method, url, body) {
   await handler(fakeReq('GET', '/unity-pool/api/config'), res)
   const pb = JSON.parse(res._out.body)
   check('HTTP GET /config：ok', pb.ok === true && typeof pb.value.connectHint === 'string')
+}
+{
+  const res = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/launch?sessionId=sess-T'), res)
+  const pb = JSON.parse(res._out.body)
+  check('HTTP GET /launch：返回启动能力摘要', pb.ok === true && pb.value && typeof pb.value.enabled === 'boolean' && Array.isArray(pb.value.projects), res._out.body.slice(0, 300))
+}
+{
+  const res = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/config'), res)
+  const pb = JSON.parse(res._out.body)
+  check('HTTP GET /config：带 launch 配置', pb.ok === true && pb.value.launch && typeof pb.value.launch.projectCount === 'number' && typeof pb.value.launch.serverStartWaitMs === 'number')
 }
 {
   // 回环守卫
@@ -1648,5 +1783,12 @@ fsp.rm(dataFile + '.sA', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.sB', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.sC', { force: true }).catch(() => {})
 fsp.rm(dataFile + '.sD', { force: true }).catch(() => {})
+fsp.rm(launchRoot, { recursive: true, force: true }).catch(() => {})
+fsp.rm(dataFile + '.launch', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.launch2', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.srv', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.srv2', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.strict', { force: true }).catch(() => {})
+fsp.rm(dataFile + '.noany', { force: true }).catch(() => {})
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILURES: ' + failures)
 process.exit(failures === 0 ? 0 : 1)

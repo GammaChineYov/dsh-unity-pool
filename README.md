@@ -74,6 +74,8 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
       - id: unity-e-line
         name: 'E线-8080'
         url: 'http://127.0.0.1:8080/mcp'
+        # v0.5.8 可选：服务离线时 unity_pool_launch 用它拉起 server（不配则要求服务已在线/Unity 侧 Auto-Start 可用）
+        startCommand: ['uvx', '--offline', '--from', 'mcpforunityserver==10.1.0', 'mcp-for-unity', '--transport', 'http', '--http-url', 'http://127.0.0.1:8080']
       - id: unity-8081
         name: 'Unity-8081'
         url: 'http://127.0.0.1:8081/mcp'
@@ -90,6 +92,21 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     busyWaitIntervalMs: 500   # 忙时等待的探测间隔（ms）
     autoUnbindOnArchive: true # 会话归档（DSH session/disposed）时自动解绑该会话锁定的实例；实例掉线/域重载对绑定会话无感（不主动解绑、不注入通知）
     callReconnectTimeoutMs: 20000 # 调用时实例离线的重连/等待时长（ms，默认 20s）：unity_mcp/umcp_* 路由到实例时给足超时让官方服务端的会话重连等待完成，超过才判定实例离线并返回失败原因
+    # ---- 启动 Unity 编辑器（v0.5.8）----
+    launchEnabled: true           # 允许 unity_pool_launch / 客户端「启动 Unity」入口
+    projects:                     # 工程清单：name = 调用/界面上的名字，path = 工程绝对路径（version/serviceId 可省）
+      - { name: '_P2_前后挡A岛', path: 'C:\Users\Public\Project\_P2_前后挡A岛' }
+      - { name: '_P4_总装车间E线', path: 'C:\Users\Public\Project\_P4_总装车间E线', serviceId: 'unity-e-line' }
+    editorPaths: []               # 额外显式 Unity.exe 路径（优先于 editorRoots 扫描，可写多个版本）
+    editorRoots:                  # Unity Hub 编辑器安装根目录（默认 Windows: C:\Program Files\Unity\Hub\Editor）
+      - 'C:\Program Files\Unity\Hub\Editor'
+    allowVersionMismatch: true    # 工程版本与已装版本不一致时用已装版本打开并标 mismatch（false = 直接报错）
+    allowAnyProject: true         # 是否允许 unity_pool_launch(projectPath=...) 启动清单外工程
+    launchLogDir: '~/.dsh/unity-pool-launch' # 启动日志目录（每个工程一个 -logFile）
+    launchWaitReadyMs: 120000     # 启动后等待实例出现的上限（ms，默认 120s）；超时返回 ready:false
+    launchPollIntervalMs: 2000    # 等待实例的轮询间隔（ms）
+    launchArgs: []                # 追加到 Unity 命令行的额外参数（如 -force-vulkan）
+    serverStartWaitMs: 30000      # 拉起 services[].startCommand 后等待服务监听的时长（ms；超时返回 server.alive:false + 日志）
     # ---- 原生工具注册（v0.5.0，Claude 式工具清单）----
     nativeToolsEnabled: true   # 绑定成功后把该服务的 MCP 工具动态注册为原生工具（umcp_<工具名>），模型上下文直接可见可调
     nativeToolSchema: compact  # 参数 schema 形态：compact=基础标量类型+description、复杂参数不展开（省上下文，默认）；full=完整 inputSchema（与 Claude 注册 MCP 工具一致，参数校验最全但上下文开销大）
@@ -119,9 +136,11 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
     stateCollectCooldownMs: 10000 # 冷启动补齐冷却（ms）：采集失败（Unity 离线/繁忙）后这段时间不再重复等待，避免每步都卡
 ```
 
-**开关位置（方便按需切换）**：客户端在会话头部「Unity」胶囊（点开面板末段）与**输入框上方**（`conversation.input.dock` 槽，聊天输入框正上方一条）各有一组状态携带开关（总开关 + 7 项子开关），运行时点击即切（走 `POST /api/state-switch`，无需重启）；**开关按会话独立（v0.4.2）**——每个会话自己的开关（`stateSwitchesBySession` 按 sessionId 持久化，重启后本会话恢复上次设置），切换只影响本会话的采集/注入；**未绑定 Unity 也可切换**（预配置，灰显提示「未绑定 Unity，绑定后生效」，绑定后立即生效；子开关在总开关关闭时禁用）；开启总开关后每次发出指令自动注入最近一次快照——需要传状态的指令前开一下、不需要时关掉即可。旧版全局平铺 `stateSwitches` 自动迁移为全局默认层（所有会话的未覆盖项继承它）。
+**开关位置（方便按需切换）**：客户端在会话头部「Unity」胶囊（点开面板末段）与**输入框上方**（`conversation.input.dock` 槽，聊天输入框正上方一条）各有一组状态携带开关（总开关 + 8 项子开关），运行时点击即切（走 `POST /api/state-switch`，无需重启）；**开关按会话独立（v0.4.2）**——每个会话自己的开关（`stateSwitchesBySession` 按 sessionId 持久化，重启后本会话恢复上次设置），切换只影响本会话的采集/注入；**未绑定 Unity 也可切换**（预配置，灰显提示「未绑定 Unity，绑定后生效」，绑定后立即生效；子开关在总开关关闭时禁用）；开启总开关后每次发出指令自动注入最近一次快照——需要传状态的指令前开一下、不需要时关掉即可。旧版全局平铺 `stateSwitches` 自动迁移为全局默认层（所有会话的未覆盖项继承它）。
 
 **绑定入口两处（v0.5.3）**：头部「Unity」胶囊只在已有会话头部时存在，**新会话（首条消息前）没有头部槽** → 绑定入口另落在输入框上方 dock 左端的绑定芯片（点开 = 服务池实例列表 + 锁定/解绑/扫描），因此新会话也能提前绑定实例；两处都按默认绑定（并行开发同一实例是正常用法，不再先试探 `force:false` 再重试）。
+
+**启动入口（v0.5.8）**：输入框上方 dock 的「启动 Unity」芯片，点开浮窗上部即工程清单（名称/版本/是否带 MCP 包/运行中），点「启动」= `POST /api/launch` → 拉起编辑器并等实例出现后自动绑定；首次导入可能 1~3 分钟，期间芯片显示「启动中…」，完成后提示「已启动并绑定：<实例名>（N 个工具）」。未配置 `projects` 时显示配置指引（也可让 Agent 用 `unity_pool_launch(projectPath=...)`）。
 
 **两处 UI 同源（v0.4.1）**：头部胶囊、输入条 dock 的开关与绑定状态共用客户端共享状态源（模块级 pub-sub store，按 sessionId 分槽）——任一入口切换/绑定/解绑立即广播，另一入口即时同步；胶囊另有 5s 轻轮询兜底（agent 工具调用 `unity_pool_bind`/`unity_pool_unbind`、其它标签页的变化 ≤5s 自动反映到胶囊，无需手动刷新）。
 
@@ -133,6 +152,7 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 | `unity_pool_scan` | 服务重探 + 实例重读 + 扫描端口段发现新服务；**全程有预算（v0.5.5）**——单端口 `scanPortTimeoutMs`、整体 `scanTimeoutMs`（默认 20s），超时的端口记入返回的 `skippedPorts`，整体超时返回 `timedOut:true` + 已完成部分（不会永远「运行中」） |
 | `unity_pool_bind` | 锁定本会话目标实例（instance=Name@hash/hash 前缀 / serviceId / 自动分配；force 覆盖排他）；**每次绑定都返回该服务最新 MCP 工具列表 `tools`（name/description/inputSchema）+ `toolsCount`**（同服务重复绑定也重拉保持新鲜；拉取失败回退上次缓存并附 `toolsError`，不阻断绑定）；**绑定后该服务工具自动注册为原生工具 `umcp_<工具名>`（v0.5.0）**——模型上下文直接可见全部工具名/描述/参数并原生调用（等价 `unity_mcp` 转发，未绑定会话调用报「未锁定目标实例」）；**注意：工具列表为服务级并集**（同服务多工程实例的自定义工具合并列出，个别工具可能不属于当前实例，调用失败即说明该实例未注册） |
 | `unity_mcp` | 代理 MCP 工具调用（自动 set_active_instance 到目标实例 → tools/call 转发）；**工具不在缓存列表时自动重拉 tools/list**；**工具名不存在时错误信息附带当前可用工具名列表（含相似工具名提示）**，选正确名称重试即可；**Unity 编译/刷新期间自动等待**（忙时探测最长 `busyMaxWaitMs`，默认 10s；可 `busyWaitEnabled:false` 关闭）；**调用失败返回附带编辑器状态 `editorState`**（isCompiling/isUpdating/progressCount，便于判断是否忙碌所致）；返回 `text`（image/audio/resource 内容块以 `[image: ...]` 占位，不静默丢弃）；**调用前后各检查一次 Console（v0.5.2）**——期间新增的错误（编译错误/运行时报错）随本次结果返回（结构化 `errorWatch` + 文本附在 `text` 末尾，默认前 5 条、单条 2000 字符，同一批只返回一次） |
+| `unity_pool_launch` | **启动 Unity 编辑器并等就绪、自动绑定本会话（v0.5.8）**：`project`（配置清单名）或 `projectPath`（任意工程绝对路径）；解析已装版本（`editorPaths`/`editorRoots`，版本不一致默认用已装版本并标 `mismatch`）、检查 `Temp/UnityLockfile` 防重复打开、以 `-projectPath`/`-logFile` 拉起、轮询服务池直到该工程实例出现（默认最长 `launchWaitReadyMs`=120s）→ 自动 `bind` 并带工具列表；返 `pid`/`logFile`/`instance`/`binding`，未就绪返 `ready:false` + 指引；可选 `editorPath`/`version`/`serviceId`/`waitMs`/`bind`/`waitReady`/`force`。**注意**：启动编辑器抢物理资源，Agent 自行启动前必须先写当日排期台账（`_mini`: `C:\Users\Public\Project\_schedule\YYYY-MM-DD.md`；`_pc`: `E:\dsh\schedule\YYYY-MM-DD.md`），单次 ≤30min |
 | `unity_pool_unbind` | 释放锁定 + 关闭本会话 MCP 会话（同时清掉本会话的错误携带游标，重绑后重建基线） |
 | `unity_pool_state` | 查看/刷新本会话的 Unity 状态携带快照（v0.4.0）：立即采集一次并按开关返回各项状态（截图文件路径/选中项/序列化字段/Console）+ view.state（开关值与缓存摘要）；`refresh:false` 只读缓存 |
 
@@ -147,16 +167,19 @@ New-Item -ItemType Junction -Path "C:\Users\PC\dsh-unity-pool\node_modules" -Tar
 - `POST /unity-pool/api/unbind` `{sessionId}` —— 释放。
 - `GET /unity-pool/api/state?sessionId=<id>` —— 当前状态携带缓存与视图；
 - `POST /unity-pool/api/state-refresh` `{sessionId}` —— 立即重新采集一次状态；
-- `POST /unity-pool/api/state-switch` `{sessionId, key, value}` —— 运行时切换状态开关（key: stateEnabled / stateGameScreenshot / stateSceneScreenshot / stateSelection / stateUiSnapshot / stateSerialized / stateConsoleAll / stateConsoleSelected，无需重启）。
+- `POST /unity-pool/api/state-switch` `{sessionId, key, value}` —— 运行时切换状态开关（key: stateEnabled / stateGameScreenshot / stateSceneScreenshot / stateSelection / stateUiSnapshot / stateSerialized / stateConsoleAll / stateConsoleSelected / stateConsoleError，无需重启）。
+- `GET /unity-pool/api/launch` —— 启动能力摘要（工程清单 + 最近启动记录，同 `view.launch`）；
+- `POST /unity-pool/api/launch` `{sessionId, project? | projectPath?, editorPath?, version?, serviceId?, waitReady?, waitMs?, bind?, force?}` —— 启动编辑器并等实例就绪、自动绑定（v0.5.8；客户端「启动 Unity」走这里）。
 
 ## 测试
 
 ```powershell
-node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 240 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）+ v0.5.5 扫描卡死回归（响应体永不结束的挂起服务/挂起端口/串行链自愈/工具级预算内返回）+ v0.5.6 冷启动补齐回归（绑定前无缓存/同步求值为空串/装配瀑布注册/装配阶段补齐/回合缓存/热缓存零等待/未开状态不注入/失败有界返回/冷却不重复等待/开关可关闭）（UNITY_POOL_LIB 环境变量可指向被测 lib）
+node "C:\Users\Landrom\dsh-unity-pool\scripts\smoke-test-v2.mjs"   # 259 项：mock mcp-for-unity ×2 + 实例发现/会话锁定/排他/会话隔离/代理转发/动态工具重拉/跨服务重拉/重复绑定带工具/未知工具错误附工具名+相似提示/view 工具名速查/tools 失败回退缓存/图片占位/53 工具全量对照/scan/持久化/工具/HTTP/忙时等待/失败附状态/探测失败保守等待/归档自动解绑/归档解绑动态通知/状态携带（默认全关/全项采集/截图落盘/防超长/开关切换/单项失败/context 注入/HTTP）+ 状态开关 per-session（隔离/持久化/迁移/缺 sessionId 拒绝）+ v0.5.0 原生工具注册（绑定注册 umcp_*/compact 标量保留+复杂不展开/full 完整 schema/未绑定报错/已绑定转发成功/view.nativeTools 摘要/stop 注销/跨服务同名接管/解绑不注销/nativeToolsEnabled=false 禁用）+ v0.5.2 错误日志携带（首次建基线/新增带回/明细进 text/编译错误识别/同批只报一次/超上限只显前 5 条/单条 2000 字符截断/Console 清空不误报/编译完成无错误/编译+编译错误/view 摘要/解绑重建基线/自定义上限/开关关闭零探测/计数不可用降级）+ v0.5.5 扫描卡死回归（响应体永不结束的挂起服务/挂起端口/串行链自愈/工具级预算内返回）+ v0.5.6 冷启动补齐回归（绑定前无缓存/同步求值为空串/装配瀑布注册/装配阶段补齐/回合缓存/热缓存零等待/未开状态不注入/失败有界返回/冷却不重复等待/开关可关闭）+ v0.5.8 启动编辑器（编辑器版本解析/启动参数/等待实例自动绑定/view.launch/重复打开保护/未就绪路径/版本 mismatch/allowAnyProject/lockfile 判定/HTTP launch）（UNITY_POOL_LIB 环境变量可指向被测 lib）
 ```
 
 ## 变更日志
 
+- `0.5.8` **启动 Unity 编辑器能力（Agent 工具 + 客户端入口）**：新增 `unity_pool_launch` 工具与 `POST /api/launch`，一条调用完成「拉起编辑器 → 等 MCP 实例出现 → 自动绑定本会话」（用户需求「加个启动 Unity 编辑器的能力」）。实现要点：① **工程来源**两路——`projects` 清单（按 name 启动，`view.launch.projects` 可见路径/版本/是否带 MCP 包/是否运行中）或 `projectPath`（任意工程，`allowAnyProject:false` 可禁）；② **编辑器解析**——`editorPaths` 优先，否则扫描 `editorRoots`（默认 `C:\Program Files\Unity\Hub\Editor\<版本>\Editor\Unity.exe`，macOS 兼容），按工程 `ProjectVersion.txt` 精确匹配；版本不一致默认用已装最新版打开并标 `mismatch`（`allowVersionMismatch:false` 可直接报错）；③ **防重复打开**——本插件启动记录里的进程仍活着、或工程 `Temp/UnityLockfile` 存在 → 返回 `alreadyRunning:true` 并尽量直接绑定现有实例（`force:true` 才强制再开）；④ **启动**——`-projectPath <工程> -logFile <launchLogDir>/<工程>-<时间>.log` + `launchArgs`，detached + `unref`（不占宿主进程）；⑤ **就绪判定**——每 `launchPollIntervalMs` 执行一次整池 probe（带既有预算），按「实例名 == 工程名 → 名称互相包含 → 启动后新出现且仅一个实例」匹配，默认最长 `launchWaitReadyMs`=120s，超时返回 `ready:false` + 后续指引（编辑器通常仍在导入）；⑥ **自动绑定**——就绪后调既有 `bind`（force 默认 true），返回 `toolsCount`；⑦ **可观测**——`view.launch` / `GET /api/launch` 给出工程清单与最近 10 条启动记录（pid/是否存活/是否就绪/日志路径），客户端输入框 dock 新增「启动 Unity」芯片与工程清单浮窗；⑧ **提示**——工程没有 `com.coplaydev.unity-mcp` 时明确告知「启动后不会出现在服务池」；工具描述与系统提示写清「Agent 自行启动前必须先写资源排期台账」；⑨ **服务自愈（可选）**——目标服务全离线且配置了 `services[].startCommand` 时，`launch` 先按命令拉起 mcp-for-unity（日志落 `launchLogDir/server-<service>-<time>.log`），并在 `serverStartWaitMs` 内等服务监听；子进程 env 会去掉 `no_proxy` 里 httpx 无法解析的 `[::1]`（实测本机 DSH 进程 env 带该项会让 `uvx mcp-for-unity` 直接抛 `InvalidURL: Invalid port: ':1]'`），Unity 侧 Auto-Start 被代理 env/URL 安全策略挡住时也能用；服务已在线则跳过。测试：smoke-test-v2 扩到 **259 项全过**（新增 19 项：解析版本/启动参数/实例出现后自动绑定/view.launch/重复打开保护/未就绪路径/未就绪记录可见/服务 startCommand 拉起/服务未监听提示/服务已在线不重复拉起/子进程 no_proxy 清理/版本 mismatch/严格版本报错/allowAnyProject/非 Unity 工程拒绝/lockfile 判定/工具描述/GET /api/launch/config），client VM 冒烟扩到 **49 项全过**（新增 4 项：dock 启动入口/工程清单/`POST /api/launch` 带工程名/就绪提示；顺带修正状态子开关数量断言 8→9）。⚠️ **本机配置需在 `cordis.patch.yml` 的 unity-pool 段补 `projects` 清单（已补 6 个工程）**，并重启 `dsh web`（host 端）；客户端刷新页面即生效。
 - `0.5.7` **修复「同一 MCP 服务上并存两个 Unity 实例时，本会话绑定失效、所有 MCP 调用被拦」**（2026-09-16 实测复现）。根因：实例选择此前**只**依赖官方 session-scoped state（`set_active_instance` 写入、按 `Mcp-Session-Id` 存），而插件仅在本地镜像 `client.activeInstance` ≠ 绑定实例时才去激活；服务端 MCP 会话一旦被重建（服务重启 / 会话被清理 / 编辑器域重载），本地镜像仍是陈旧的「已激活」→ 跳过激活 → 在**没有选择**的新会话上直发 `tools/call`。该服务上只有 1 个实例时官方会自动选中（把问题掩盖住），一旦并存 2 个实例就被官方守卫拦死：`Multiple Unity instances are connected. Call set_active_instance … Available: [...]`。修复三处：
   - **① 每调用路由（主修复）**：每次 `tools/call` 都携带 `unity_instance=<绑定实例>`，由官方 `UnityInstanceMiddleware` 在**本次调用**上直接解析实例，不依赖会丢失的 session state（实测：全新 MCP 会话、不做任何 `set_active_instance`，带该参数也能正确路由；`read_console`/`manage_editor`/`batch_execute` 等均接受）。老服务端不认识该参数时**自动降级**为只用会话状态（判定后只降级一次，不影响旧部署）。
   - **② 本地镜像与 MCP 会话同生共死**：`activeInstance` 改为「镜像值 + 记下它属于哪个 session」，会话被重置/失效即作废（`sessionInvalid` 时显式清空），不再出现「本地以为已激活、服务端其实没有」。
