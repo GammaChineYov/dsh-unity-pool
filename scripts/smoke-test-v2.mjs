@@ -606,8 +606,10 @@ const cKilled2 = []
 poolC.isPidAlive = (pid) => cAlive.has(Number(pid))
 poolC.findEditorPids = async () => [6666]
 poolC._killPid = async (pid, force) => { cKilled2.push({ pid: Number(pid), force }); if (force) cAlive.delete(Number(pid)); return true }
+poolC.findModalDialogs = async () => ({ supported: true, pids: [6666], dialogs: [{ hwnd: 100, title: 'Save changes?', message: 'Save scene before closing?', options: [{ index: 0, text: 'Save', enabled: true }, { index: 1, text: "Don't Save", enabled: true }] }] })
 const rStuck = await poolC.closeProject('sess-CLOSE', { projectPath: launchProj, waitMs: 300 })
 check('close：优雅超时返回 stillRunning 且不强杀', rStuck.stillRunning === true && rStuck.closed === false && cKilled2.length === 1 && cKilled2[0].force === false, JSON.stringify(rStuck))
+check('close：优雅超时附带模态窗选项', Array.isArray(rStuck.dialogs) && rStuck.dialogs.length === 1 && /Don't Save/.test(JSON.stringify(rStuck.dialogs[0].options)), JSON.stringify(rStuck.dialogs))
 const rForced = await poolC.closeProject('sess-CLOSE', { projectPath: launchProj, force: true, waitMs: 800 })
 check('close：force=true 强杀成功', rForced.closed === true && rForced.forced === true && cKilled2.some(k => k.force === true), JSON.stringify(rForced))
 
@@ -643,6 +645,46 @@ poolTerm._killPid = async (pid, force, tree) => { termKilled.push({ pid: Number(
 const rTerm = await poolTerm.closeProject('sess-TERM', { projectPath: launchProj })
 check('close：服务已离线也清理 Unity 侧残留终端（cmd /k）', Array.isArray(rTerm.serverStopped) && rTerm.serverStopped.some(x => x.reason === 'server-terminal' && x.pids.includes(8888)) && termKilled.some(k => k.pid === 8888 && k.tree === true), JSON.stringify(rTerm.serverStopped))
 poolTerm.stop()
+
+// ---------- v0.5.8 模态窗（枚举 / 选择 / 启动阻塞提前返回） ----------
+const poolDlg = createPool(launchCtx, { services: [], dataFile: dataFile + '.dlg' })
+let dialogOpen = true
+const dialogSample = JSON.stringify([{
+  Hwnd: 100, Pid: 1234, Title: 'Opening project', ClassName: '#32770',
+  Children: [
+    { Hwnd: 101, Text: 'The project was last opened in a newer version', ClassName: 'Static', Id: 0, Enabled: true },
+    { Hwnd: 102, Text: 'Continue', ClassName: 'Button', Id: 1, Enabled: true },
+    { Hwnd: 103, Text: 'Quit', ClassName: 'Button', Id: 2, Enabled: true },
+  ],
+}])
+poolDlg.findUnityPids = async () => [1234]
+poolDlg._execText = async (file, args) => {
+  const cmd = String((args || []).join(' '))
+  if (cmd.includes('DlgClick')) { dialogOpen = false; return '' }
+  if (cmd.includes('DlgApi')) return dialogOpen ? dialogSample : '[]'
+  return ''
+}
+const foundD = await poolDlg.findModalDialogs()
+check('dialog：枚举标题/正文/按钮选项', foundD.supported === true && foundD.dialogs.length === 1 && foundD.dialogs[0].title === 'Opening project' && /newer version/.test(foundD.dialogs[0].message) && foundD.dialogs[0].options.map(o => o.text).join('|') === 'Continue|Quit', JSON.stringify(foundD.dialogs))
+const clickedD = await poolDlg.clickModalDialogOption({ hwnd: 100, option: 'Continue' })
+check('dialog：按文案选择选项并返回 remaining 为空', clickedD.clicked === true && clickedD.option.text === 'Continue' && Array.isArray(clickedD.remaining) && clickedD.remaining.length === 0, JSON.stringify(clickedD))
+poolDlg.stop()
+
+// 启动等待期间检测到模态窗 → 提前返回选项（不等满 waitMs）
+const sDlg = makeMcpServer([])
+await sDlg.listen()
+const poolDlgLaunch = createPool(launchCtx, {
+  services: [{ id: 'SDLG', name: '对话框服务', url: 'http://127.0.0.1:' + sDlg.port() + '/mcp' }],
+  dataFile: dataFile + '.dlg2', probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
+  editorRoots: [editorRoot], launchLogDir, launchWaitReadyMs: 5000, launchPollIntervalMs: 100,
+  launchDialogCheckAfterMs: 100, launchDialogCheckEnabled: true,
+})
+poolDlgLaunch._spawnEditor = () => ({ pid: 9090 })
+poolDlgLaunch.isPidAlive = () => true
+poolDlgLaunch.findModalDialogs = async () => ({ supported: true, pids: [9090], dialogs: [{ hwnd: 1, title: 'Version mismatch', message: 'Continue?', options: [{ index: 0, text: 'Continue', enabled: true }] }] })
+const rDlgLaunch = await poolDlgLaunch.launch('sess-DLG', { projectPath: launchProj })
+check('launch：检测到模态窗提前返回（dialogBlocked + 选项）', rDlgLaunch.dialogBlocked === true && Array.isArray(rDlgLaunch.dialogs) && rDlgLaunch.dialogs.length === 1 && rDlgLaunch.waitedMs < 3000, JSON.stringify({ blocked: rDlgLaunch.dialogBlocked, waitedMs: rDlgLaunch.waitedMs, d: rDlgLaunch.dialogs }))
+poolDlgLaunch.stop(); sDlg.close()
 poolC.stop()
 poolL.stop(); poolL2.stop(); poolStrict.stop(); poolNoAny.stop()
 sL.close(); sL2.close()
@@ -662,7 +704,7 @@ const fakeCtx = {
   webServer: { register(route) { routes.push(route); return () => {} } },
 }
 apply(fakeCtx, { services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }], dataFile: dataFile + '.apply', probeIntervalMs: 5000 })
-check('apply：注册 8 个工具', registered.length === 8 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_pool_launch','unity_pool_close','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
+check('apply：注册 9 个工具', registered.length === 9 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_pool_launch','unity_pool_close','unity_pool_dialog','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
 check('apply：unity_pool_launch 描述含工程清单/排期提示', /projectPath/.test(registered.find(t => t.name === 'unity_pool_launch').description) && /台账/.test(registered.find(t => t.name === 'unity_pool_launch').description))
 check('apply：系统提示段含 unity_mcp', sections.some(s => s.name === 'unity-pool' && /unity_mcp/.test(s.text)))
 check('apply：HTTP 路由注册', routes.length === 1 && routes[0].path === '/unity-pool/api')

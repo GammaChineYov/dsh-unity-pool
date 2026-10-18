@@ -105,6 +105,7 @@ let staleStatus = false // 下一次 /api/status 返回"请求发出时"的旧�
 const viewOf = { binding: { serviceId: 'S1', instance: { name: 'ProjX', id: 'ProjX@aaaa1111' } }, state: () => JSON.parse(JSON.stringify(serverState)) }
 // v0.5.8：启动 Unity 入口的工程清单（dock 浮窗上部）
 let launchRunning = false
+let dialogOpenFlag = true // 模态窗（/api/dialog）
 function launchOf() {
   return {
     enabled: true,
@@ -128,6 +129,17 @@ function servicesOf() {
 }
 function mockFetch(url, opts) {
   fetched.push(url)
+  if (typeof url === 'string' && url.includes('/unity-pool/api/dialog')) {
+    if (opts && opts.method === 'POST') {
+      const body = JSON.parse((opts && opts.body) || '{}')
+      dialogOpenFlag = false
+      return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: { clicked: true, option: { text: body.option === 1 ? 'Quit' : 'Continue' }, remaining: [] } }) })
+    }
+    const dialogs = dialogOpenFlag
+      ? [{ hwnd: 100, pid: 1234, title: 'Opening project', message: 'The project was last opened in a newer version', options: [{ index: 0, text: 'Continue', enabled: true }, { index: 1, text: 'Quit', enabled: true }] }]
+      : []
+    return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: { supported: true, dialogs, hint: dialogs.length ? null : '没有模态窗' } }) })
+  }
   if (typeof url === 'string' && url.includes('/unity-pool/api/state-switch')) {
     const body = JSON.parse((opts && opts.body) || '{}')
     if (body.key === 'stateEnabled') {
@@ -448,6 +460,22 @@ check('★ 点「关闭」：POST /api/close 带工程名', fetched.slice(before
 const utClosed = await settle(ut.Comp, props, 2)
 const closeNotes = collect(utClosed, n => n.type === 'div' && typeof n.props.children === 'string' && /已关闭/.test(n.props.children), [])
 check('★ 关闭后提示「已关闭」', closeNotes.length === 1, 'notes=' + collect(utClosed, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('关闭') >= 0).join('|'))
+
+// ---------- v0.5.8 模态窗（检查 / 选项）----------
+const checkDlgBtn = buttons(utClosed).find(b => b.props.children === '检查')
+check('★ 右上角弹窗提供「检查」模态窗按钮', Boolean(checkDlgBtn), 'buttons=' + buttons(utClosed).map(b => b.props.children).join(','))
+checkDlgBtn.props.onClick()
+await new Promise(r => setTimeout(r, 0))
+const utDlg = await settle(ut.Comp, props, 2)
+const dlgOptionBtns = ['Continue', 'Quit'].map(t => buttons(utDlg).find(b => b.props.children === t))
+check('★ 检查到模态窗并显示选项', dlgOptionBtns.every(Boolean), 'buttons=' + buttons(utDlg).map(b => b.props.children).join(','))
+const beforeDlg = fetched.length
+dlgOptionBtns[1].props.onClick()
+await new Promise(r => setTimeout(r, 0))
+check('★ 选择模态窗选项走 /api/dialog（POST）', fetched.slice(beforeDlg).some(u => u.includes('/api/dialog')), fetched.slice(beforeDlg).join(','))
+const utDlgAfter = await settle(ut.Comp, props, 2)
+const dlgNote = collect(utDlgAfter, n => n.type === 'div' && typeof n.props.children === 'string' && /已选择/.test(n.props.children), [])
+check('★ 选择后提示「已选择」', dlgNote.length === 1, 'notes=' + collect(utDlgAfter, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('选择') >= 0).join('|'))
 
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILED: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
