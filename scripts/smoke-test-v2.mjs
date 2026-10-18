@@ -3,6 +3,7 @@ import http from 'node:http'
 import * as fsp from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
+import { spawn } from 'node:child_process'
 
 const PLUGIN = process.env.UNITY_POOL_LIB
   ? 'file:///' + process.env.UNITY_POOL_LIB.replace(/\\/g, '/')
@@ -557,11 +558,59 @@ let badErr = null
 try { poolL.planLaunch({ projectPath: path.join(launchRoot, 'not-unity') }) } catch (err) { badErr = String(err && err.message) }
 check('launch：非 Unity 工程被拒绝', /不是有效的 Unity 工程/.test(String(badErr)), String(badErr))
 
-// Temp/UnityLockfile 存在 → 视为已运行（用没有启动记录的 projMismatch）
+// 陈旧 Temp/UnityLockfile（能正常 r+ 打开 = 没有 Unity 独占持有）→ 不判运行中，并清理
 await fsp.mkdir(path.join(projMismatch, 'Temp'), { recursive: true })
-await fsp.writeFile(path.join(projMismatch, 'Temp', 'UnityLockfile'), '')
-check('launch：Temp/UnityLockfile 存在视为已运行', Boolean(poolL.projectRunning(projMismatch)) && poolL.projectRunning(projMismatch).source === 'lockfile')
-await fsp.rm(path.join(projMismatch, 'Temp'), { recursive: true, force: true })
+const staleLock = path.join(projMismatch, 'Temp', 'UnityLockfile')
+await fsp.writeFile(staleLock, '')
+const oldTime = new Date(Date.now() - 60000)
+await fsp.utimes(staleLock, oldTime, oldTime)
+check('launch：陈旧 UnityLockfile 不判运行中（旧实现只看文件存在）', poolL.projectRunning(projMismatch) === null)
+const staleStillThere = await fsp.access(staleLock).then(() => true).catch(() => false)
+check('launch：陈旧 UnityLockfile 自动清理', staleStillThere === false)
+
+// 被独占持有的锁文件（Windows FileShare.None）→ 判运行中；用 PowerShell 持有 5s 模拟 Unity
+if (process.platform === 'win32') {
+  await fsp.writeFile(staleLock, '')
+  const ps = "$fs=[System.IO.File]::Open('" + staleLock.replace(/'/g, "''") + "','Open','ReadWrite','None'); Start-Sleep -Seconds 5; $fs.Close()"
+  const holder = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { stdio: 'ignore' })
+  await sleep(1000)
+  const held = poolL.projectRunning(projMismatch)
+  check('launch：被独占持有的 UnityLockfile 判运行中', Boolean(held) && held.source === 'lockfile', JSON.stringify(held))
+  try { holder.kill() } catch { /* ignore */ }
+  await sleep(300)
+  try { await fsp.rm(staleLock, { force: true }) } catch { /* ignore */ }
+}
+
+// ---------- v0.5.8 关闭编辑器（unity_pool_close 配套能力）----------
+const poolC = createPool(launchCtx, {
+  services: [], dataFile: dataFile + '.close',
+  projects: [{ name: 'ProjLaunch', path: launchProj }],
+  editorRoots: [editorRoot], launchLogDir, closeWaitMs: 1200,
+})
+let cAlive = new Set([5555])
+const cKilled = []
+poolC.isPidAlive = (pid) => cAlive.has(Number(pid))
+poolC.findEditorPids = async () => [5555]
+poolC._killPid = async (pid, force) => { cKilled.push({ pid: Number(pid), force }); cAlive.delete(Number(pid)); return true }
+const rClose = await poolC.closeProject('sess-CLOSE', { project: 'ProjLaunch' })
+check('close：优雅关闭成功（未强杀）', rClose.closed === true && rClose.pids.includes(5555) && rClose.forced === false && cKilled.every(k => k.force === false), JSON.stringify(rClose))
+// 未运行 + 陈旧锁 → alreadyClosed 并清理
+await fsp.writeFile(staleLock, '')
+await fsp.utimes(staleLock, oldTime, oldTime)
+poolC.findEditorPids = async () => []
+const rClosedIdle = await poolC.closeProject('sess-CLOSE', { projectPath: projMismatch })
+check('close：未运行时 alreadyClosed 且清理陈旧锁', rClosedIdle.alreadyClosed === true && rClosedIdle.staleLockfileRemoved === true, JSON.stringify(rClosedIdle))
+// 优雅超时 → stillRunning 且不强杀；force=true 才强杀
+cAlive = new Set([6666])
+const cKilled2 = []
+poolC.isPidAlive = (pid) => cAlive.has(Number(pid))
+poolC.findEditorPids = async () => [6666]
+poolC._killPid = async (pid, force) => { cKilled2.push({ pid: Number(pid), force }); if (force) cAlive.delete(Number(pid)); return true }
+const rStuck = await poolC.closeProject('sess-CLOSE', { projectPath: launchProj, waitMs: 300 })
+check('close：优雅超时返回 stillRunning 且不强杀', rStuck.stillRunning === true && rStuck.closed === false && cKilled2.length === 1 && cKilled2[0].force === false, JSON.stringify(rStuck))
+const rForced = await poolC.closeProject('sess-CLOSE', { projectPath: launchProj, force: true, waitMs: 800 })
+check('close：force=true 强杀成功', rForced.closed === true && rForced.forced === true && cKilled2.some(k => k.force === true), JSON.stringify(rForced))
+poolC.stop()
 poolL.stop(); poolL2.stop(); poolStrict.stop(); poolNoAny.stop()
 sL.close(); sL2.close()
 
@@ -580,7 +629,7 @@ const fakeCtx = {
   webServer: { register(route) { routes.push(route); return () => {} } },
 }
 apply(fakeCtx, { services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }], dataFile: dataFile + '.apply', probeIntervalMs: 5000 })
-check('apply：注册 7 个工具', registered.length === 7 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_pool_launch','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
+check('apply：注册 8 个工具', registered.length === 8 && ['unity_pool_status','unity_pool_scan','unity_pool_bind','unity_pool_launch','unity_pool_close','unity_mcp','unity_pool_unbind','unity_pool_state'].every(n => registered.some(t => t.name === n)), registered.map(t => t.name).join(','))
 check('apply：unity_pool_launch 描述含工程清单/排期提示', /projectPath/.test(registered.find(t => t.name === 'unity_pool_launch').description) && /台账/.test(registered.find(t => t.name === 'unity_pool_launch').description))
 check('apply：系统提示段含 unity_mcp', sections.some(s => s.name === 'unity-pool' && /unity_mcp/.test(s.text)))
 check('apply：HTTP 路由注册', routes.length === 1 && routes[0].path === '/unity-pool/api')

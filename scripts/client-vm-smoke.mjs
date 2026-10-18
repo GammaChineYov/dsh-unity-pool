@@ -96,6 +96,9 @@ let serverState = JSON.parse(JSON.stringify(STATE_OFF))
 const fetched = []
 let lastBindBody = null // 最近一次 /api/bind 请求体（断言不再发 force=false）
 let lastLaunchBody = null // 最近一次 /api/launch 请求体（v0.5.8）
+let lastCloseBody = null // 最近一次 /api/close 请求体（v0.5.8）
+let launchHold = false // true 时 /api/launch 挂起不返回（测「只有被点的工程显示启动中」）
+let launchHoldResolve = null
 let staleStatus = false // 下一次 /api/status 返回"请求发出时"的旧快照（延迟 30ms），模拟轮询响应晚于用户切换
 // viewOf.binding 可变：模拟宿主侧绑定/解绑（面板锁定按钮 / agent 工具 / 其它标签页）
 // ProjY 模拟被其它会话占用：普通 bind 409，force 才成功
@@ -152,10 +155,21 @@ function mockFetch(url, opts) {
     const body = JSON.parse((opts && opts.body) || '{}')
     lastLaunchBody = body
     const proj = String(body.project || 'ProjX')
-    return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: {
+    const response = { json: () => Promise.resolve({ ok: true, value: {
       sessionId: MOCK_SESSION, launched: true, pid: 4242, ready: true,
       instance: { name: proj, id: proj + '@aaaa1111' },
       binding: { toolsCount: 12 },
+      view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() },
+    } }) }
+    if (launchHold) return new Promise(resolve => { launchHoldResolve = () => resolve(response) })
+    return Promise.resolve(response)
+  }
+  if (typeof url === 'string' && url.includes('/unity-pool/api/close')) {
+    const body = JSON.parse((opts && opts.body) || '{}')
+    lastCloseBody = body
+    launchRunning = false
+    return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: {
+      closed: true, forced: false, pids: [4242],
       view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() },
     } }) })
   }
@@ -401,14 +415,39 @@ const panelLaunchBtns = buttons(utFinal).filter(b => b.props.children === '启�
 check('★ 右上角胶囊弹窗列出工程清单（2 个「启动」按钮）', panelLaunchBtns.length === 2, 'buttons=' + buttons(utFinal).map(b => b.props.children).join(','))
 const dockFinal = await settle(dock.Comp, props, 2)
 check('★ 输入条 dock 不再有「启动 Unity」入口（已移到胶囊弹窗）', !buttons(dockFinal).some(b => b.props.children === '启动 Unity'), 'buttons=' + buttons(dockFinal).map(b => b.props.children).join(','))
+// 启动：先挂起响应，验证「只有被点的工程显示启动中」（旧 bug 是所有工程都显示）
+launchHold = true
 const beforeLaunch = fetched.length
 lastLaunchBody = null
 panelLaunchBtns[0].props.onClick()
 await new Promise(r => setTimeout(r, 0))
+const utLaunching = await settle(ut.Comp, props, 1)
+const launchingLabels = buttons(utLaunching).map(b => b.props.children)
+check('★ 启动中只标记被点的工程（其余仍是「启动」）', launchingLabels.filter(x => x === '启动中…').length === 1 && launchingLabels.filter(x => x === '启动').length === 1, launchingLabels.join('|'))
 check('★ 胶囊弹窗点「启动」：POST /api/launch 带工程名', fetched.slice(beforeLaunch).some(u => u.includes('/api/launch')) && lastLaunchBody && lastLaunchBody.project === 'ProjX', JSON.stringify(lastLaunchBody))
+launchHold = false
+launchHoldResolve()
+await new Promise(r => setTimeout(r, 0))
 const utAfterLaunch = await settle(ut.Comp, props, 2)
 const noteNodes = collect(utAfterLaunch, n => n.type === 'div' && typeof n.props.children === 'string' && /已启动并绑定/.test(n.props.children), [])
 check('★ 启动后就绪提示「已启动并绑定」', noteNodes.length === 1, 'notes=' + collect(utAfterLaunch, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('启动') >= 0).join('|'))
+
+// 关闭（配套能力）：模拟 ProjX 运行中 → 行内显示「关闭」→ 点击走 /api/close
+launchRunning = true
+const refreshBtn = buttons(utAfterLaunch).find(b => b.props.children === '刷新')
+refreshBtn.props.onClick()
+await new Promise(r => setTimeout(r, 0))
+const utRunning = await settle(ut.Comp, props, 2)
+const closeBtns = buttons(utRunning).filter(b => b.props.children === '关闭')
+check('★ 运行中的工程显示「关闭」按钮', closeBtns.length === 1, 'buttons=' + buttons(utRunning).map(b => b.props.children).join(','))
+const beforeClose = fetched.length
+lastCloseBody = null
+closeBtns[0].props.onClick()
+await new Promise(r => setTimeout(r, 0))
+check('★ 点「关闭」：POST /api/close 带工程名', fetched.slice(beforeClose).some(u => u.includes('/api/close')) && lastCloseBody && lastCloseBody.project === 'ProjX', JSON.stringify(lastCloseBody))
+const utClosed = await settle(ut.Comp, props, 2)
+const closeNotes = collect(utClosed, n => n.type === 'div' && typeof n.props.children === 'string' && /已关闭/.test(n.props.children), [])
+check('★ 关闭后提示「已关闭」', closeNotes.length === 1, 'notes=' + collect(utClosed, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('关闭') >= 0).join('|'))
 
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILED: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
