@@ -660,6 +660,7 @@ const dialogSample = JSON.stringify([{
 poolDlg.findUnityPids = async () => [1234]
 poolDlg._execText = async (file, args) => {
   const cmd = String((args || []).join(' '))
+  if (cmd.includes('DlgClose')) { dialogOpen = false; return '' }
   if (cmd.includes('DlgClick')) { dialogOpen = false; return '' }
   if (cmd.includes('DlgApi')) return dialogOpen ? dialogSample : '[]'
   return ''
@@ -668,7 +669,46 @@ const foundD = await poolDlg.findModalDialogs()
 check('dialog：枚举标题/正文/按钮选项', foundD.supported === true && foundD.dialogs.length === 1 && foundD.dialogs[0].title === 'Opening project' && /newer version/.test(foundD.dialogs[0].message) && foundD.dialogs[0].options.map(o => o.text).join('|') === 'Continue|Quit', JSON.stringify(foundD.dialogs))
 const clickedD = await poolDlg.clickModalDialogOption({ hwnd: 100, option: 'Continue' })
 check('dialog：按文案选择选项并返回 remaining 为空', clickedD.clicked === true && clickedD.option.text === 'Continue' && Array.isArray(clickedD.remaining) && clickedD.remaining.length === 0, JSON.stringify(clickedD))
+// 关闭窗口（WM_CLOSE）
+dialogOpen = true
+const closedD = await poolDlg.closeModalDialog({ hwnd: 100 })
+check('dialog：close 用 WM_CLOSE 关闭窗口并返回 remaining', closedD.closed === true && Array.isArray(closedD.remaining) && closedD.remaining.length === 0, JSON.stringify(closedD))
 poolDlg.stop()
+
+// 后台扫描缓存 + autoDismissDialogs 自动选择
+const poolWatch = createPool(launchCtx, { services: [], dataFile: dataFile + '.watch' })
+poolWatch.unityExpected = () => true
+poolWatch.findModalDialogs = async () => ({ supported: true, pids: [1], dialogs: [{ hwnd: 1, title: 'Opening project', message: 'x', options: [{ index: 0, text: 'Continue', enabled: true }] }] })
+const watchCache = await poolWatch.refreshDialogs()
+check('dialog：后台扫描写入 view.dialogs 缓存', Array.isArray(watchCache.dialogs) && watchCache.dialogs.length === 1 && poolWatch.view('x').dialogs.dialogs.length === 1, JSON.stringify(watchCache.dialogs))
+poolWatch.stop()
+
+const poolAuto = createPool(launchCtx, { services: [], dataFile: dataFile + '.auto', autoDismissDialogs: [{ match: 'Opening project', option: 'Continue' }] })
+poolAuto.unityExpected = () => true
+let autoOpen = true
+poolAuto.findModalDialogs = async () => ({ supported: true, pids: [1], dialogs: autoOpen ? [{ hwnd: 9, title: 'Opening project', message: '', options: [{ index: 0, text: 'Continue', enabled: true }] }] : [] })
+poolAuto.clickModalDialogOption = async () => { autoOpen = false; return { clicked: true, option: { text: 'Continue' }, remaining: [] } }
+const autoCache = await poolAuto.refreshDialogs()
+check('dialog：autoDismissDialogs 自动选择匹配项', Array.isArray(autoCache.dialogs) && autoCache.dialogs.length === 0 && autoCache.dismissed && autoCache.dismissed.clicked.length === 1, JSON.stringify(autoCache))
+poolAuto.stop()
+
+// MCP 掉线失败：自动附带模态窗，提示（可能自动处理）
+const poolOff = createPool(launchCtx, {
+  services: [{ id: 'OFF', name: '离线', url: 'http://127.0.0.1:9/mcp' }],
+  dataFile: dataFile + '.off', probeTimeoutMs: 200, probeIntervalMs: 600000,
+  busyWaitEnabled: false, errorWatchEnabled: false,
+})
+poolOff.bindings['sess-OFF'] = { serviceId: 'OFF', instanceId: 'X@1', boundAt: Date.now() }
+poolOff.sessionClient = () => ({
+  activeInstance: 'X@1',
+  tools: [{ name: 'manage_scene' }],
+  ensureInit: async () => {},
+  callTool: async () => { throw new Error('MCP 请求失败: fetch failed（实例掉线）') },
+})
+poolOff.refreshDialogs = async () => ({ supported: true, pids: [1], dialogs: [{ hwnd: 1, title: 'Opening project', message: 'x', options: [{ index: 0, text: 'Continue', enabled: true }] }] })
+const rOff = await poolOff.proxyMcp('sess-OFF', 'manage_scene', {})
+check('proxyMcp：掉线失败附带模态窗与处理提示', rOff.isError === true && Array.isArray(rOff.dialogs) && rOff.dialogs.length === 1 && /模态窗/.test(rOff.text) && /unity_pool_dialog/.test(rOff.text), String(rOff.text).slice(0, 300))
+poolOff.stop()
 
 // 启动等待期间检测到模态窗 → 提前返回选项（不等满 waitMs）
 const sDlg = makeMcpServer([])

@@ -133,6 +133,9 @@ function mockFetch(url, opts) {
     if (opts && opts.method === 'POST') {
       const body = JSON.parse((opts && opts.body) || '{}')
       dialogOpenFlag = false
+      if (body.action === 'close') {
+        return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: { closed: true, remaining: [] } }) })
+      }
       return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: { clicked: true, option: { text: body.option === 1 ? 'Quit' : 'Continue' }, remaining: [] } }) })
     }
     const dialogs = dialogOpenFlag
@@ -476,6 +479,22 @@ check('★ 选择模态窗选项走 /api/dialog（POST）', fetched.slice(before
 const utDlgAfter = await settle(ut.Comp, props, 2)
 const dlgNote = collect(utDlgAfter, n => n.type === 'div' && typeof n.props.children === 'string' && /已选择/.test(n.props.children), [])
 check('★ 选择后提示「已选择」', dlgNote.length === 1, 'notes=' + collect(utDlgAfter, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('选择') >= 0).join('|'))
+
+// 关闭窗口（WM_CLOSE）
+dialogOpenFlag = true
+const recheckBtn = buttons(utDlgAfter).find(b => b.props.children === '检查')
+if (recheckBtn) recheckBtn.props.onClick()
+await new Promise(r => setTimeout(r, 0))
+const utDlgRe = await settle(ut.Comp, props, 2)
+const closeDlgBtn = buttons(utDlgRe).find(b => b.props.children === '关闭窗口')
+check('★ 模态窗提供「关闭窗口」按钮', Boolean(closeDlgBtn), 'buttons=' + buttons(utDlgRe).map(b => b.props.children).join(','))
+const beforeDlgClose = fetched.length
+if (closeDlgBtn) closeDlgBtn.props.onClick()
+await new Promise(r => setTimeout(r, 0))
+check('★ 关闭窗口走 /api/dialog（action=close）', fetched.slice(beforeDlgClose).some(u => u.includes('/api/dialog')), fetched.slice(beforeDlgClose).join(','))
+const utDlgClosed = await settle(ut.Comp, props, 2)
+const closedDlgNote = collect(utDlgClosed, n => n.type === 'div' && typeof n.props.children === 'string' && /已关闭模态窗/.test(n.props.children), [])
+check('★ 关闭后提示「已关闭模态窗」', closedDlgNote.length === 1, 'notes=' + collect(utDlgClosed, n => n.type === 'div', []).map(n => String(n.props.children)).filter(s => s.indexOf('模态窗') >= 0).join('|'))
 
 console.log(failures === 0 ? '\nALL PASS' : '\nFAILED: ' + failures)
 process.exit(failures === 0 ? 0 : 1)
