@@ -665,6 +665,12 @@ poolDlg._execText = async (file, args) => {
   if (cmd.includes('DlgApi')) return dialogOpen ? dialogSample : '[]'
   return ''
 }
+// PowerShell 输出 UTF-8：中文模态窗标题/按钮不乱码（实测默认 GBK 会变 ???）
+const poolEnc = createPool(launchCtx, { services: [], dataFile: dataFile + '.enc' })
+const encText = await poolEnc._execText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '"中文测试-ABC"'], 15000)
+check('dialog：PowerShell 输出按 UTF-8 解码（中文不乱码）', /中文测试-ABC/.test(encText), JSON.stringify(encText))
+poolEnc.stop()
+
 const foundD = await poolDlg.findModalDialogs()
 check('dialog：枚举标题/正文/按钮选项', foundD.supported === true && foundD.dialogs.length === 1 && foundD.dialogs[0].title === 'Opening project' && /newer version/.test(foundD.dialogs[0].message) && foundD.dialogs[0].options.map(o => o.text).join('|') === 'Continue|Quit', JSON.stringify(foundD.dialogs))
 const clickedD = await poolDlg.clickModalDialogOption({ hwnd: 100, option: 'Continue' })
