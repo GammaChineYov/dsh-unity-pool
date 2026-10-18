@@ -610,6 +610,39 @@ const rStuck = await poolC.closeProject('sess-CLOSE', { projectPath: launchProj,
 check('close：优雅超时返回 stillRunning 且不强杀', rStuck.stillRunning === true && rStuck.closed === false && cKilled2.length === 1 && cKilled2[0].force === false, JSON.stringify(rStuck))
 const rForced = await poolC.closeProject('sess-CLOSE', { projectPath: launchProj, force: true, waitMs: 800 })
 check('close：force=true 强杀成功', rForced.closed === true && rForced.forced === true && cKilled2.some(k => k.force === true), JSON.stringify(rForced))
+
+// 关闭后收掉「在线但无实例」的服务（残留 uvx/终端）；stopServer:false 保留
+const sIdle = makeMcpServer([])
+await sIdle.listen()
+const poolIdle = createPool(launchCtx, {
+  services: [{ id: 'IDLE', name: '空闲服务', url: 'http://127.0.0.1:' + sIdle.port() + '/mcp', startCommand: ['x'] }],
+  dataFile: dataFile + '.idle', probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
+  projects: [{ name: 'IdleProj', path: launchProj }], editorRoots: [editorRoot], launchLogDir,
+})
+const idleKilled = []
+poolIdle.findEditorPids = async () => []
+poolIdle.findPortOwnerPids = async () => [7777]
+poolIdle._killPid = async (pid, force, tree) => { idleKilled.push({ pid: Number(pid), force, tree }); return true }
+poolIdle.serverProcesses.set('IDLE', { pid: 7777, logFile: 'x', startedAt: Date.now(), command: ['x'] })
+const rIdle = await poolIdle.closeProject('sess-IDLE', { projectPath: launchProj })
+check('close：关闭后停掉无实例的空闲服务（含子进程树）', rIdle.alreadyClosed === true && Array.isArray(rIdle.serverStopped) && rIdle.serverStopped.some(x => x.serviceId === 'IDLE') && idleKilled.some(k => k.pid === 7777 && k.tree === true), JSON.stringify(rIdle.serverStopped))
+const rIdleKeep = await poolIdle.closeProject('sess-IDLE', { projectPath: launchProj, stopServer: false })
+check('close：stopServer=false 保留服务', rIdleKeep.alreadyClosed === true && Array.isArray(rIdleKeep.serverStopped) && rIdleKeep.serverStopped.length === 0, JSON.stringify(rIdleKeep.serverStopped))
+poolIdle.stop()
+sIdle.close()
+// 服务已离线但 Unity 侧「MCP Server」终端（cmd /k）还在 → 也要清掉
+const poolTerm = createPool(launchCtx, {
+  services: [{ id: 'TOFF', name: '离线服务', url: 'http://127.0.0.1:9/mcp' }],
+  dataFile: dataFile + '.term', probeIntervalMs: 600000, probeTimeoutMs: 200, scanPorts: [],
+  projects: [{ name: 'TermProj', path: launchProj }], editorRoots: [editorRoot], launchLogDir,
+})
+const termKilled = []
+poolTerm.findEditorPids = async () => []
+poolTerm.findServerTerminalPids = async () => [8888]
+poolTerm._killPid = async (pid, force, tree) => { termKilled.push({ pid: Number(pid), force, tree }); return true }
+const rTerm = await poolTerm.closeProject('sess-TERM', { projectPath: launchProj })
+check('close：服务已离线也清理 Unity 侧残留终端（cmd /k）', Array.isArray(rTerm.serverStopped) && rTerm.serverStopped.some(x => x.reason === 'server-terminal' && x.pids.includes(8888)) && termKilled.some(k => k.pid === 8888 && k.tree === true), JSON.stringify(rTerm.serverStopped))
+poolTerm.stop()
 poolC.stop()
 poolL.stop(); poolL2.stop(); poolStrict.stop(); poolNoAny.stop()
 sL.close(); sL2.close()
