@@ -87,6 +87,17 @@ function collect(tree, pred, out) {
 function inputs(tree) { return collect(tree, n => n.type === 'input', []) }
 function buttons(tree) { return collect(tree, n => n.type === 'button', []) }
 function clickables(tree) { return collect(tree, n => typeof n.props.onClick === 'function', []) }
+// v0.5.9：取节点的纯文本（断言按钮文案/悬浮浮层正文）
+function textOf(node) {
+  const out = []
+  ;(function walk(n) {
+    if (n == null || n === false) return
+    if (typeof n === 'string' || typeof n === 'number') { out.push(String(n)); return }
+    if (Array.isArray(n)) { n.forEach(walk); return }
+    if (n.props) walk(n.props.children)
+  })(node)
+  return out.join('')
+}
 
 // fetch mock：按 URL 返回（同步 resolve 的 promise）
 const MOCK_SESSION = 'sess-M'
@@ -97,6 +108,7 @@ const fetched = []
 let lastBindBody = null // 最近一次 /api/bind 请求体（断言不再发 force=false）
 let lastLaunchBody = null // 最近一次 /api/launch 请求体（v0.5.8）
 let lastCloseBody = null // 最近一次 /api/close 请求体（v0.5.8）
+let lastRefreshBody = null // 最近一次 /api/state-refresh 请求体（v0.5.9 手动采集）
 let launchHold = false // true 时 /api/launch 挂起不返回（测「只有被点的工程显示启动中」）
 let launchHoldResolve = null
 let staleStatus = false // 下一次 /api/status 返回"请求发出时"的旧快照（延迟 30ms），模拟轮询响应晚于用户切换
@@ -191,6 +203,20 @@ function mockFetch(url, opts) {
   if (typeof url === 'string' && url.includes('/unity-pool/api/unbind')) {
     viewOf.binding = null
     const v = { sessionId: MOCK_SESSION, view: { binding: null, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() } }
+    return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
+  }
+  // v0.5.9：手动「采集」——唯一采集入口，返回 cache + injectText（下一条消息将注入的原文）
+  if (typeof url === 'string' && url.includes('/unity-pool/api/state-refresh')) {
+    lastRefreshBody = JSON.parse((opts && opts.body) || '{}')
+    serverState.cache = { at: Date.now(), instanceId: 'ProjX@aaaa1111', entries: [{ key: 'stateSelection', label: '当前选中项', ok: true, textLength: 9 }] }
+    serverState.injectText = '<unity_pool_state>\nUnity 状态（ProjX@aaaa1111，采集于 10:00:00）：\n- [当前选中项] count=1\n</unity_pool_state>'
+    const v = {
+      sessionId: MOCK_SESSION,
+      cache: serverState.cache,
+      error: null,
+      injectText: serverState.injectText,
+      view: { binding: viewOf.binding, services: servicesOf(), state: JSON.parse(JSON.stringify(serverState)), launch: launchOf() },
+    }
     return Promise.resolve({ json: () => Promise.resolve({ ok: true, value: v }) })
   }
   if (typeof url === 'string' && url.includes('/unity-pool/api/state')) {
@@ -423,6 +449,50 @@ bindBtn = dockBindBtnOf(dTree)
 check('★ dock 解绑后入口回到「绑定 Unity」', Boolean(bindBtn) && collect(bindBtn, n => n.type === 'span' && n.props.children === '绑定 Unity', []).length === 1, bindBtn && JSON.stringify(collect(bindBtn, n => n.type === 'span', []).map(s => s.props.children)))
 const dockScanBtn = buttons(dTree).find(b => b.props.children === '扫描')
 check('dock 浮窗提供「扫描」（实例不在列表时可重扫）', Boolean(dockScanBtn), 'buttons=' + buttons(dTree).map(b => b.props.children).join(','))
+
+// ---------- v0.5.9：手动「采集」按钮 + 悬浮预览「下一条消息将注入的上下文」 ----------
+{
+  serverState.enabled = true
+  serverState.switches.stateEnabled = true
+  serverState.switches.stateSelection = true
+  serverState.injectText = ''
+  serverState.cache = null
+  let dt = await settle(dock.Comp, props, 3)
+  const allBtnText = buttons(dt).map(b => String(textOf(b))).join(',')
+  const collectBtn = buttons(dt).find(b => String(textOf(b)) === '采集')
+  check('v0.5.9 dock 渲染「采集」按钮（唯一采集入口）', Boolean(collectBtn), 'buttons=' + allBtnText)
+  // 悬浮：未采集时也要有明确提示（不静默空白）
+  const chipsWrap = collect(dt, n => typeof n.props.onMouseEnter === 'function', [])[0]
+  check('dock 状态开关容器可悬浮（注入预览入口）', Boolean(chipsWrap))
+  chipsWrap.props.onMouseEnter()
+  dt = await settle(dock.Comp, props, 2)
+  let tipText = collect(dt, n => typeof n.props.children === 'string', []).map(n => n.props.children).join('\n')
+  check('★ 未采集时悬浮：提示「还没有采集结果，点采集」', /下一条消息将注入的上下文/.test(tipText) && /还没有采集结果/.test(tipText), tipText.slice(0, 200))
+
+  // 点「采集」→ POST /api/state-refresh → 服务端回 injectText → store 更新
+  const beforeCollect = fetched.length
+  collectBtn.props.onClick(EV)
+  await new Promise(r => setTimeout(r, 0))
+  check('★ 点「采集」：POST /api/state-refresh（带 sessionId）',
+    fetched.slice(beforeCollect).filter(u => u.includes('/api/state-refresh')).length === 1
+    && lastRefreshBody && lastRefreshBody.sessionId === MOCK_SESSION, JSON.stringify(lastRefreshBody))
+  dt = await settle(dock.Comp, props, 3)
+  const chipsWrap2 = collect(dt, n => typeof n.props.onMouseEnter === 'function', [])[0]
+  chipsWrap2.props.onMouseEnter()
+  dt = await settle(dock.Comp, props, 2)
+  tipText = collect(dt, n => typeof n.props.children === 'string', []).map(n => n.props.children).join('\n')
+  check('★ 采集后悬浮：显示将注入的上下文原文（所见即所注）',
+    /下一条消息将注入的上下文（采集于/.test(tipText) && /Unity 状态（ProjX@aaaa1111/.test(tipText) && /当前选中项/.test(tipText), tipText.slice(0, 240))
+  check('★ 采集后悬浮：标题带上下文长度（字符数）', /· \d+ 字符/.test(tipText), tipText.slice(0, 120))
+  check('★ 采集成功：按钮旁显示已采集时刻（有反馈，不静默）', /已采集 \d{2}:\d{2}:\d{2}/.test(String(textOf(dt))), String(textOf(dt)).slice(0, 240))
+
+  // 移出：浮层收起
+  const wrapLeave = collect(dt, n => typeof n.props.onMouseLeave === 'function', [])[0]
+  wrapLeave.props.onMouseLeave()
+  dt = await settle(dock.Comp, props, 2)
+  const tipGone = !collect(dt, n => typeof n.props.children === 'string', []).some(n => /下一条消息将注入的上下文/.test(String(n.props.children)))
+  check('悬浮移出：浮层收起', tipGone)
+}
 
 // ---------- v0.5.8 启动 Unity 入口（用户要求放在右上角胶囊弹窗，不放 dock） ----------
 const utFinal = await settle(ut.Comp, props, 2)

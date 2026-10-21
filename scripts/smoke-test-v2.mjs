@@ -160,7 +160,7 @@ function makeMcpServer(instances, opts = {}) {
         if (code.includes('UnityEditor.Selection.objects')) {
           result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: selectionResult, compiler: 'roslyn' } }) }] }
         } else if (code.includes('ConsoleWindow')) {
-          result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: 'selectedRow=3\nACTIVE_TEXT:\n[传输>>] mock console selected entry (at Assets/Test.cs:10)', compiler: 'roslyn' } }) }] }
+          result = { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Code executed successfully.', data: { result: 'selectedRow=3\nACTIVE_TEXT:\n[传输>>] mock console selected entry (at Assets/Test.cs:10)\nUnityEngine.Debug:Log (object,UnityEngine.Object)\nUnityEngine.Events.UnityEvent:Invoke ()\nTMPro.TMP_Dropdown:SetValue (int,bool) (at ./Library/PackageCache/com.unity.textmeshpro@3.0.7/Scripts/Runtime/TMP_Dropdown.cs:431)\nTMPro.TMP_Dropdown:SetValue (int,bool) (at ./Library/PackageCache/com.unity.textmeshpro@3.0.7/Scripts/Runtime/TMP_Dropdown.cs:431)\nGameObject:OnValueChanged (int) (at Assets/Script/Test.cs:88)', compiler: 'roslyn' } }) }] }
         } else {
           // 忙状态探测：按 busyPattern 消费（true=忙, false=空闲, 'error'=探测报错），耗尽后默认空闲
           const b = busyPattern.length > 0 ? busyPattern.shift() : false
@@ -1402,6 +1402,7 @@ const poolState = createPool(ctx, {
   stateDir,
   stateMaxChars: 8000,
   stateSnapshotMaxChars: 4000,
+  stateSnapshotStyle: 'map', // v0.5.9：本节专门测「地图形态」
   stateConsoleMaxChars: 6000,
   stateConsoleCount: 50,
 })
@@ -1440,20 +1441,49 @@ check('状态携带：ui_snapshot 缓存优先（force_refresh=false，不再每
 check('状态携带：序列化字段含组件与字段数', byKey.serialized && byKey.serialized.ok === true && /BoxCollider/.test(byKey.serialized.text || '') && /组件数 2/.test(byKey.serialized.text || ''), JSON.stringify(byKey.serialized).slice(0, 200))
 check('状态携带：Console 全文含 mock 日志', byKey.consoleAll && byKey.consoleAll.ok === true && /mock console line 1/.test(byKey.consoleAll.text || ''), JSON.stringify(byKey.consoleAll).slice(0, 200))
 check('状态携带：Console 选中条目含 ACTIVE_TEXT', byKey.consoleSelected && byKey.consoleSelected.ok === true && /ACTIVE_TEXT/.test(byKey.consoleSelected.text || ''), JSON.stringify(byKey.consoleSelected).slice(0, 200))
+// v0.5.9：Console 栈压缩（过滤引擎/包内部行 + 同栈层只留一次 + 省略计数）
+const selTxt = (byKey.consoleSelected && byKey.consoleSelected.text) || ''
+check('★ Console 栈压缩：过滤引擎/第三方包内部栈帧',
+  !/UnityEngine\.Debug:Log|UnityEngine\.Events\.UnityEvent|TMPro\.TMP_Dropdown|PackageCache/.test(selTxt), selTxt.slice(0, 320))
+check('★ Console 栈压缩：保留业务栈帧并标注省略行数',
+  /Assets\/Script\/Test\.cs:88/.test(selTxt) && /~（省略 \d+ 行通用\/重复栈）/.test(selTxt), selTxt.slice(0, 400))
 
 // ---- 快照地图模式（v0.4.1）：Library JSON 生成分层地图（概览/分支/业务引用/锚点/定位） ----
 const mapFile = path.join(dir, 'snap-map.json')
+// v0.5.9 增补：一个 List 字段（SoftKeyboard.data -> 10 个 Key）+ 10 个同族锚点（Key_*），
+// 用来回归「同一字段多条折叠为 N 项」「同族锚点合并为 Key_* ×N」——此前会各占一行把预算吃光。
+const keyNodes = Array.from({ length: 10 }, (_, i) => ({
+  id: 110 + i, name: 'Key_' + (i + 1), parentId: 109,
+  path: '外部Canvas/设备健康度/软键盘/Key_' + (i + 1), active: true, components: ['SoftKeyboardKey'],
+}))
+const keyListRefs = keyNodes.map(n => ({
+  sourceId: 109, sourceComponent: 'SoftKeyboard', field: 'data',
+  targetId: n.id, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: n.id,
+}))
+const keyNoiseRefs = keyNodes.flatMap(n => Array.from({ length: 5 }, () => ({
+  sourceId: n.id, sourceComponent: 'SoftKeyboardKey', field: 'm_Font',
+  targetId: 200, targetType: 'Font', targetKind: 'Asset', targetGoId: 0,
+})))
 await fsp.writeFile(mapFile, JSON.stringify({
   version: '1.0', generatedAt: new Date().toISOString(),
   roots: [101],
   nodes: [
     { id: 101, name: '设备健康度', parentId: 0, path: '外部Canvas/设备健康度', active: true, components: [] },
     { id: 102, name: 'Btn详情', parentId: 101, path: '外部Canvas/设备健康度/Btn详情', active: true, components: ['Image', 'Button'] },
-    { id: 103, name: 'BarChart', parentId: 101, path: '外部Canvas/设备健康度/BarChart', active: true, components: ['BarChart', 'TSViewPanel'] },
-    { id: 104, name: 'painter_0', parentId: 103, path: '外部Canvas/设备健康度/BarChart/painter_0', active: true, components: ['Painter'] },
-    { id: 105, name: 'painter_1', parentId: 103, path: '外部Canvas/设备健康度/BarChart/painter_1', active: true, components: ['Painter'] },
+    { id: 103, name: 'BarChart', parentId: 101, path: '外部Canvas/设备健康度/BarChart', active: true, components: ['BarChart', 'TSViewPanel'], prefabPath: 'Assets/Prefabs/BarChart.prefab', isPrefabInstanceRoot: true, prefabOverrides: true },
+    { id: 104, name: 'painter_0', parentId: 103, path: '外部Canvas/设备健康度/BarChart/painter_0', active: true, components: ['Painter'], added: true },
+    { id: 105, name: 'painter_1', parentId: 103, path: '外部Canvas/设备健康度/BarChart/painter_1', active: false, components: ['Painter'] },
     { id: 106, name: 'popup', parentId: 101, path: '外部Canvas/设备健康度/popup', active: true, components: ['HealthPopupController'] },
     { id: 107, name: 'text', parentId: 106, path: '外部Canvas/设备健康度/popup/text', active: true, components: ['Text'] },
+    { id: 109, name: '软键盘', parentId: 101, path: '外部Canvas/设备健康度/软键盘', active: true, components: ['SoftKeyboard'] },
+    ...keyNodes,
+    // v0.5.9：4 个同族同规模分支（painter_2..5）→ 分支索引应合并成 painter_* ×4
+    { id: 120, name: 'painter_2', parentId: 101, path: '外部Canvas/设备健康度/painter_2', active: true, components: ['Painter'] },
+    { id: 121, name: 'painter_3', parentId: 101, path: '外部Canvas/设备健康度/painter_3', active: true, components: ['Painter'] },
+    { id: 122, name: 'painter_4', parentId: 101, path: '外部Canvas/设备健康度/painter_4', active: true, components: ['Painter'] },
+    { id: 123, name: 'painter_5', parentId: 101, path: '外部Canvas/设备健康度/painter_5', active: true, components: ['Painter'] },
+    // v0.5.9：深层锚点（父 popup 下两层）→ 锚点行应带「@相对根路径」
+    { id: 130, name: 'DeepChart', parentId: 106, path: '外部Canvas/设备健康度/popup/DeepChart', active: true, components: ['DeepPanel'] },
   ],
   refs: [
     { sourceId: 103, sourceComponent: 'BarChart', field: 'm_Font', targetId: 200, targetType: 'Font', targetKind: 'Asset', targetGoId: 0 },
@@ -1462,6 +1492,14 @@ await fsp.writeFile(mapFile, JSON.stringify({
     { sourceId: 106, sourceComponent: 'HealthPopupController', field: 'barNotifier', targetId: 108, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 108 },
     { sourceId: 106, sourceComponent: 'HealthPopupController', field: 'btnClose', targetId: 102, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 102 },
     { sourceId: 102, sourceComponent: 'Button', field: 'm_OnClick[0]', targetId: 106, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 106, method: 'SetActive' },
+    ...keyListRefs,
+    ...keyNoiseRefs,
+    // 深层锚点的 5 条出引用（R>=5 才会进锚点）
+    { sourceId: 130, sourceComponent: 'DeepPanel', field: 'slot0', targetId: 107, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 107 },
+    { sourceId: 130, sourceComponent: 'DeepPanel', field: 'slot1', targetId: 107, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 107 },
+    { sourceId: 130, sourceComponent: 'DeepPanel', field: 'slot2', targetId: 107, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 107 },
+    { sourceId: 130, sourceComponent: 'DeepPanel', field: 'slot3', targetId: 107, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 107 },
+    { sourceId: 130, sourceComponent: 'DeepPanel', field: 'slot4', targetId: 107, targetType: 'GameObject', targetKind: 'GameObject', targetGoId: 107 },
   ],
 }, null, 2))
 sState.setSnapshotFile(mapFile)
@@ -1471,12 +1509,86 @@ if (!cacheMap) { for (let i = 0; i < 60 && poolState._stateCollecting; i++) awai
 const mapTxt = ((cacheMap?.entries || []).find(e => e.key === 'uiSnapshot') || {}).text || ''
 check('地图：注入为分层地图（头/根/分支/业务引用/锚点/定位）', /UI Snapshot 地图/.test(mapTxt) && /根: \[101\]设备健康度/.test(mapTxt) && /分支/.test(mapTxt) && /业务引用/.test(mapTxt) && /锚点/.test(mapTxt) && /定位: /.test(mapTxt), mapTxt.slice(0, 300))
 check('地图：分支索引含节点数与自定义组件', /BarChart \[3 节点 R:3\]/.test(mapTxt) && /BarChart,Painter,TSViewPanel/.test(mapTxt), mapTxt.slice(0, 400))
-check('地图：业务引用含自定义字段与 m_OnClick', /HealthPopupController\.barNotifier/.test(mapTxt) && /m_OnClick\[0\]/.test(mapTxt), mapTxt.slice(0, 500))
+check('★ 地图：根带 Hierarchy 路径（快照物体的路由，便于定位）',
+  /路径: 外部Canvas\/设备健康度/.test(mapTxt), mapTxt.split('\n').slice(0, 4).join(' | '))
+check('★ 地图：深层锚点带 @相对根路径（直接子级不写）',
+  /\[130\] DeepChart \(DeepPanel\) R:5 B:0 @popup\/DeepChart/.test(mapTxt) && !/\[106\] popup .*@/.test(mapTxt),
+  (mapTxt.match(/^.*DeepChart.*$/gm) || []).join(' | ').slice(0, 240))
+check('地图：业务引用含自定义字段与 m_OnClick', /\.barNotifier\s+->/.test(mapTxt) && /\.m_OnClick\[0\]\s+->.*SetActive/.test(mapTxt), mapTxt.slice(0, 500))
 check('地图：资源/自引用噪音聚合（m_Font ×3 不逐条）', /资源\/自引用聚合/.test(mapTxt) && /BarChart\.m_Font ×3/.test(mapTxt) && !/m_Font -> /.test(mapTxt), mapTxt.slice(0, 600))
 check('地图：锚点含高价值/自定义组件节点', /\[103\] BarChart/.test(mapTxt) && /\[106\] popup/.test(mapTxt), mapTxt.slice(0, 600))
+// v0.5.9：信息密度——List 字段折叠 + 同族锚点合并（用户反馈「一个 list 拆成几十行」）
+check('★ 地图：List 字段引用折叠为「N 项」（不再一行一条）',
+  /SoftKeyboard\.data\s+->\s+10 项 \[Key_1, Key_2, Key_3, Key_4, …/.test(mapTxt) && !/SoftKeyboard\.data -> \[Key_1\]/.test(mapTxt),
+  (mapTxt.match(/SoftKeyboard\.data[^\n]*/g) || []).join(' | ').slice(0, 300))
+check('★ 地图：同一来源物只写一次（物体行 → 组件行 → .字段行，三层缩进）',
+  /^- \[106\]popup\n {4}HealthPopupController\n {8}\.barNotifier\s+->/m.test(mapTxt)
+  && /^ {8}\.btnClose\s+->/m.test(mapTxt)
+  && !/\[106\]popup\.HealthPopupController/.test(mapTxt),
+  (mapTxt.match(/^.*popup.*$/gm) || []).concat(mapTxt.match(/^ {4,8}\..*$/gm) || []).join(' | ').slice(0, 320))
+check('★ 地图：同族锚点合并为「Key_* ×N」（不逐个键位占行）',
+  /Key_\* \(SoftKeyboardKey\) R:5 B:1 ×10/.test(mapTxt) && !/\[110\] Key_1 \(SoftKeyboardKey\)/.test(mapTxt),
+  (mapTxt.match(/Key_[^\n]*/g) || []).join(' | ').slice(0, 300))
+check('★ 地图：同族同规模分支合并（painter_* ×N，不逐个占行）',
+  /painter_\* \[1 节点 R:0\] \| Painter ×4/.test(mapTxt) && !/\[120\] painter_2/.test(mapTxt),
+  (mapTxt.match(/^.*painter.*$/gm) || []).join(' | ').slice(0, 300))
 sState.setSnapshotFile(null)
 
-// ---- 忙时跳过采集（v0.4.1，2026-08-20 用户第 3 次遇到「Unity 反复读条」）：Unity 编译/读条期间不采集 ----
+// ---- v0.5.9：tree 形态（Hierarchy 式缩进树，默认形态；用户口径「跟 Hierarchy 差不多」） ----
+{
+  const savedStyle = poolState.cfg.stateSnapshotStyle
+  poolState.cfg.stateSnapshotStyle = 'tree'
+  sState.setSnapshotFile(mapFile)
+  const cacheTree = await poolState.collectState('sess-S')
+  const treeTxt = ((cacheTree?.entries || []).find(e => e.key === 'uiSnapshot') || {}).text || ''
+  check('★ 树：Hierarchy 式缩进（根 0 / 子 2 空格 / 孙 4 空格）',
+    /^# UI 层级/m.test(treeTxt) && /^- 设备健康度$/m.test(treeTxt)
+    && /^ {2}- BarChart(?: |$)/m.test(treeTxt) && /^ {4}- painter_0(?: |$)/m.test(treeTxt),
+    treeTxt.slice(0, 320))
+  check('★ 树：不带实例 id（纯层级名字，跟 Hierarchy 一致）', !/\[-?\d+\]/.test(treeTxt), treeTxt.slice(0, 240))
+  check('树：未激活节点用 · 标记（省预算）', /^ {4}- ·painter_1$/m.test(treeTxt), treeTxt.slice(0, 320))
+  check('树：根带 Hierarchy 路径', /^根路径: 外部Canvas\/设备健康度$/m.test(treeTxt), treeTxt.split('\n').slice(0, 3).join(' | '))
+  check('★ 树：预制体实例标 [P:asset 路径+]（对齐 Hierarchy 的预制体图标/加号）',
+    /^ {2}- BarChart \[P:Assets\/Prefabs\/BarChart\.prefab\+\]$/m.test(treeTxt), treeTxt.slice(0, 360))
+  check('★ 树：预制体实例内新增子物体标 +', /^ {4}- painter_0 \+$/m.test(treeTxt), treeTxt.slice(0, 360))
+  // 截断：预算很小的时候只显示前 N 个并标注
+  const savedMax = poolState.cfg.stateSnapshotMaxChars
+  poolState.cfg.stateSnapshotMaxChars = 420
+  const cacheTrunc = await poolState.collectState('sess-S')
+  const truncTxt = ((cacheTrunc?.entries || []).find(e => e.key === 'uiSnapshot') || {}).text || ''
+  check('树：超预算截断并标注（显示 X/Y 节点）', /…\[已截断：显示 \d+\/\d+ 节点/.test(truncTxt), JSON.stringify(truncTxt))
+  poolState.cfg.stateSnapshotMaxChars = savedMax
+  poolState.cfg.stateSnapshotStyle = savedStyle
+  sState.setSnapshotFile(null)
+}
+
+// ---- v0.5.9：实例ID前缀压缩（同快照 id 共享长前缀 → 声明一次，逐行只写后缀） ----
+{
+  const mapFile2 = path.join(dir, 'snap-map-prefix.json')
+  await fsp.writeFile(mapFile2, JSON.stringify({
+    version: '1.0', roots: [-22639716],
+    nodes: [
+      { id: -22639716, name: 'b4', parentId: 0, path: 'Canvas/b4', active: true, components: [] },
+      { id: -22639718, name: 'label', parentId: -22639716, path: 'Canvas/b4/label', active: true, components: [] },
+      { id: -22639720, name: 'axis_x', parentId: -22639716, path: 'Canvas/b4/axis_x', active: true, components: [] },
+    ],
+    refs: [
+      { sourceId: -22639716, sourceComponent: 'BMTBFPanel', field: 'barChart', targetId: -22639718, targetKind: 'GameObject', targetGoId: -22639718 },
+    ],
+  }, null, 2))
+  sState.setSnapshotFile(mapFile2)
+  const cachePrefixed = await poolState.collectState('sess-S')
+  const prefixedTxt = ((cachePrefixed?.entries || []).find(e => e.key === 'uiSnapshot') || {}).text || ''
+  check('★ 地图：ID 前缀只声明一次（下文 [x] = 前缀+x）', /ID 前缀: -226397（/.test(prefixedTxt), prefixedTxt.slice(0, 200))
+  check('★ 地图：各行 ID 只写后缀（可逆：前缀+后缀=完整实例ID）',
+    /根: \[16\]b4/.test(prefixedTxt) && /- \[16\]b4/.test(prefixedTxt) && /- \[18\] label/.test(prefixedTxt) && /- \[20\] axis_x/.test(prefixedTxt),
+    prefixedTxt.slice(0, 400))
+  sState.setSnapshotFile(null)
+}
+
+// ---- v0.5.9：忙时不再跳过 —— 手动「采集」在 Unity 读条期间照常执行 ----
+// 旧行为（v0.4.1）：probe 到 busy 就整轮 return null → 勾了开关却什么都没注入且无声。
+// 新行为：采集只由显式动作触发，用户点了「采集」就必须拿到结果（各项独立容错）。
 const sBusy = makeMcpServer([{ id: 'ProjB2@bbbb3333', name: 'ProjB2', hash: 'bbbb3333' }], { busyPattern: [true, true, false] })
 await sBusy.listen()
 const poolBusy = createPool(ctx, {
@@ -1488,12 +1600,12 @@ const poolBusy = createPool(ctx, {
 })
 await poolBusy.probe()
 await poolBusy.bind('sess-B')
-await new Promise(r => setTimeout(r, 200)) // 等 bind 触发的异步采集（消耗 busyPattern[0]=true → 跳过）
-for (let i = 0; i < 60 && poolBusy._stateCollecting; i++) await new Promise(r2 => setTimeout(r2, 50))
+check('忙时采集：绑定后不再自动采集（缓存仍为空）', !poolBusy.stateCaches.get('sess-B'), JSON.stringify(poolBusy.stateCaches.get('sess-B')))
 const busyCache = await poolBusy.collectState('sess-B')
-check('忙时跳过：Unity 读条期间 collectState 返回 null（不采集，保留旧缓存）', busyCache === null, JSON.stringify(busyCache))
-const busyCache2 = await poolBusy.collectState('sess-B')
-check('忙时跳过：读条结束（busyPattern 耗尽）后采集恢复', busyCache2 === null || Array.isArray(busyCache2.entries), JSON.stringify(busyCache2))
+check('忙时采集：Unity 读条期间手动采集照常返回结果（不再整轮静默丢弃）',
+  busyCache !== null && Array.isArray(busyCache.entries) && busyCache.entries.length > 0, JSON.stringify(busyCache).slice(0, 240))
+check('忙时采集：忙 ≠ 不采集，选中项仍按开关采到',
+  (busyCache.entries || []).some(e => e.key === 'selection' && e.ok === true), JSON.stringify(busyCache.entries || []).slice(0, 240))
 poolBusy.stop(); sBusy.close()
 fsp.rm(dataFile + '.busy', { force: true }).catch(() => {})
 
@@ -1636,17 +1748,19 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
   const rA = await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateEnabled', value: true })
   const rB = await postJson('/unity-pool/api/state-switch', { sessionId: 'sess-T', key: 'stateSelection', value: true })
   check('状态开关：HTTP 切换总开关+子项成功', rA.ok === true && rB.ok === true && rB.value.state.enabled === true && rB.value.state.switches.stateSelection === true)
-  // 等采集缓存就绪（轮询 GET，不在注入路径上记录信号）
-  let ready = false
-  for (let i = 0; i < 60 && !ready; i++) {
-    const res = fakeRes()
-    await handler(fakeReq('GET', '/unity-pool/api/state?sessionId=sess-T'), res)
-    const pb = JSON.parse(res._out.body)
-    ready = !!(pb.value && pb.value.view && pb.value.view.state && pb.value.view.state.cache
-      && Array.isArray(pb.value.view.state.cache.entries) && pb.value.view.state.cache.entries.length > 0)
-    if (!ready) await new Promise(res2 => setTimeout(res2, 50))
-  }
-  check('状态注入：采集缓存就绪', ready)
+  // v0.5.9：采集改为**手动**（「采集」按钮 → POST /api/state-refresh），不再有自动采集入口。
+  // 这里直接打手动采集接口把缓存填上（等价用户在 dock 上点一次「采集」）。
+  const rCollect = await postJson('/unity-pool/api/state-refresh', { sessionId: 'sess-T' })
+  const resAfter = fakeRes()
+  await handler(fakeReq('GET', '/unity-pool/api/state?sessionId=sess-T'), resAfter)
+  const pbAfter = JSON.parse(resAfter._out.body)
+  const ready = !!(pbAfter.value && pbAfter.value.view && pbAfter.value.view.state && pbAfter.value.view.state.cache
+    && Array.isArray(pbAfter.value.view.state.cache.entries) && pbAfter.value.view.state.cache.entries.length > 0)
+  check('状态注入：手动「采集」把缓存填上（不再依赖自动采集）', rCollect.ok === true && ready, JSON.stringify({ ok: rCollect.ok, ready }).slice(0, 200))
+  check('状态注入：view.state.injectText = 下一条消息将注入的上下文原文（非空且含状态块）',
+    typeof pbAfter.value.view.state.injectText === 'string'
+    && pbAfter.value.view.state.injectText.includes('<unity_pool_state>'), String(pbAfter.value.view.state.injectText || '').slice(0, 120))
+  check('状态注入：手动采集入口未绑定时明确报错（不假装成功）', (await postJson('/unity-pool/api/state-refresh', { sessionId: 'sess-NOBIND' })).ok === false)
   const mkAgent = function (turn) {
     return { agent: { id: 'sess-T', session: { id: 'sess-T', events: turn > 0 ? [{ type: 'turn/start', data: { turn } }] : [] } } }
   }
@@ -1656,7 +1770,9 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
   const once2 = stateCtx.text(mkAgent(5))
   check('状态注入：任意 request 携带状态块', once1.includes('<unity_pool_state>') && once1.includes('Unity 状态（'))
   check('状态注入：同回合后续 request 返回相同状态块（供宿主整段去重）', once2 === once1 && once2.includes('<unity_pool_state>'))
-  check('状态注入：状态块不含采集时间戳（避免每 3s 变化破坏宿主去重）', !/采集于/.test(once1))
+  // v0.5.9：状态块现在**带采集时刻**（手动采集才变 → 不影响宿主去重），旧断言「不含时间戳」改为正向断言。
+  check('状态注入：状态块带手动采集时刻（仅采集才变，不破坏宿主整段去重）',
+    /采集于 \d{2}:\d{2}:\d{2}/.test(once1) && once2 === once1)
   check('状态注入：stateTurnOf 读 turn/start 回合号', poolState.stateTurnOf({ session: { events: [{ type: 'turn/start', data: { turn: 9 } }] } }) === 9)
   check('状态注入：stateTurnOf 无 events 返回 -1', poolState.stateTurnOf({ session: {} }) === -1)
   check('状态注入：stateTurnOf 空事件表返回 0', poolState.stateTurnOf({ session: { events: [] } }) === 0)
@@ -1864,8 +1980,8 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
     coldHandler(req, res)
     req._emit('data', Buffer.from(JSON.stringify(body)))
     req._emit('end')
-    await done
-    return JSON.parse(res._out ? res._out.body : '{}')
+    const out = await done
+    return JSON.parse(out.body)
   }
   async function coldGet(url) {
     const { res, done } = cRes()
@@ -1884,30 +2000,29 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
 
   const agentCold = { id: sidCold, session: { id: sidCold, events: [{ type: 'turn/start', data: { turn: 1 } }] } }
   const evalCold = () => coldContexts.map(c => ({ name: c.name, text: typeof c.text === 'function' ? c.text({ agent: agentCold, scope: agentCold }) : c.text }))
-  check('冷启动：同步 context 求值为空串（修复前形态 = 整回合没有状态块）', evalCold().find(e => e.name === 'unity-pool:state').text === '')
+  check('冷启动：同步 context 求值为空串（未采集就不注入，不再偷偷采集）', evalCold().find(e => e.name === 'unity-pool:state').text === '')
+  // v0.5.9：冷启动补齐钩子已删除（它会在装配时自动采集，与「不自动采集」冲突）
   const coldAssemble = coldHandlers['system-prompt/assemble'] || []
-  check('冷启动：注册 system-prompt/assemble 装配瀑布', coldAssemble.length === 1)
-  const tCold = Date.now()
-  let asm = { sections: [], contexts: evalCold(), tools: [], variables: {} }
-  for (const h of coldAssemble) asm = await h(asm, { agent: agentCold, scope: agentCold }, async () => asm)
-  const coldText = String(asm.contexts.find(c => c.name === 'unity-pool:state').text)
-  check('★ 冷启动：装配阶段补齐状态块（首条消息即注入）', coldText.includes('<unity_pool_state>') && coldText.includes('当前选中项'), coldText.slice(0, 200))
-  check('冷启动：补齐在预算内完成', Date.now() - tCold < 4000, (Date.now() - tCold) + 'ms')
-  check('冷启动：补齐写入回合缓存（同回合各 step 文本稳定）', evalCold().find(e => e.name === 'unity-pool:state').text === coldText)
-  const tHot = Date.now()
-  let asmHot = { sections: [], contexts: evalCold(), tools: [], variables: {} }
-  for (const h of coldAssemble) asmHot = await h(asmHot, { agent: agentCold, scope: agentCold }, async () => asmHot)
-  check('冷启动：缓存已热时零等待（不重复采集）', Date.now() - tHot < 100, (Date.now() - tHot) + 'ms')
+  check('冷启动：不再注册 system-prompt/assemble 装配瀑布（避免装配时偷偷采集）', coldAssemble.length === 0, String(coldAssemble.length))
+  // 手动「采集」→ 缓存填上 → 同回合（空串不入回合缓存）立即能注入
+  const rColdCollect = await coldPost('/unity-pool/api/state-refresh', { sessionId: sidCold })
+  check('冷启动：手动采集成功（返回 cache + injectText）',
+    rColdCollect.ok === true && rColdCollect.value && rColdCollect.value.cache
+    && String(rColdCollect.value.injectText || '').includes('<unity_pool_state>'),
+    JSON.stringify(rColdCollect).slice(0, 240))
+  const coldText = String((evalCold().find(e => e.name === 'unity-pool:state') || {}).text || '')
+  check('★ 冷启动：采集后首条消息即携带状态块（手动采集 → 每条消息注入）',
+    coldText.includes('<unity_pool_state>') && coldText.includes('当前选中项'), coldText.slice(0, 200))
+  check('冷启动：注入文本与 injectText 完全一致（所见即所注）',
+    coldText === String(rColdCollect.value.injectText || ''))
   const agentOff = { id: 'sess-NOCARRY', session: { id: 'sess-NOCARRY', events: [{ type: 'turn/start', data: { turn: 1 } }] } }
-  const tOff = Date.now()
-  let asmOff = { sections: [], contexts: [{ name: 'unity-pool:state', text: '' }], tools: [], variables: {} }
-  for (const h of coldAssemble) asmOff = await h(asmOff, { agent: agentOff, scope: agentOff }, async () => asmOff)
-  check('冷启动：未开启状态携带的会话不注入不等待', String(asmOff.contexts[0].text) === '' && Date.now() - tOff < 100, (Date.now() - tOff) + 'ms')
+  const offText = coldContexts.map(c => typeof c.text === 'function' ? c.text({ agent: agentOff, scope: agentOff }) : c.text).find(Boolean)
+  check('冷启动：未开启状态携带的会话不注入', !offText || String(offText) === '', String(offText || '').slice(0, 80))
   sCold.close()
   fsp.rm(dataFile + '.cold', { force: true }).catch(() => {})
 }
 
-// 冷启动补齐：采集失败时有界返回 + 冷却期内不重复等待 + 开关可关闭
+// v0.5.9：手动采集在服务挂起时有界返回（冷启动等待/冷却语义随自动采集一并移除）
 {
   const sColdHang = makeMcpServer([], { hangBody: true })
   await sColdHang.listen()
@@ -1915,36 +2030,27 @@ check('apply：默认关时状态 context 注入空串', stateCtx.text({ agent: 
     services: [{ id: 'SH', name: '挂起', url: 'http://127.0.0.1:' + sColdHang.port() + '/mcp' }],
     dataFile: dataFile + '.coldhang',
     probeIntervalMs: 600000, probeTimeoutMs: 300, scanPorts: [],
-    stateFirstTurnWaitMs: 800, stateCollectCooldownMs: 10000,
   })
   poolColdHang.setStateSwitch('sess-HANG', 'stateEnabled', true)
   poolColdHang.setStateSwitch('sess-HANG', 'stateSelection', true)
   poolColdHang.bindings['sess-HANG'] = { serviceId: 'SH', instanceId: 'Ghost@1', boundAt: Date.now() }
-  const tHangA = Date.now()
-  const rHangA = await poolColdHang.ensureStateTextForTurn('sess-HANG', 1)
-  const msHangA = Date.now() - tHangA
-  check('冷启动：采集失败时有界返回（不挂死）', rHangA === '' && msHangA < 3000, msHangA + 'ms')
-  const tHangB = Date.now()
-  const rHangB = await poolColdHang.ensureStateTextForTurn('sess-HANG', 2)
-  const msHangB = Date.now() - tHangB
-  check('冷启动：冷却期内不重复等待（Unity 离线时不每步都卡）', rHangB === '' && msHangB < 100, msHangB + 'ms')
+  check('手动采集：自动补齐入口 ensureStateTextForTurn / waitForStateCache 已删除',
+    typeof poolColdHang.ensureStateTextForTurn === 'undefined' && typeof poolColdHang.waitForStateCache === 'undefined')
+  const tHang = Date.now()
+  const rHang = await poolColdHang.collectState('sess-HANG')
+  const msHang = Date.now() - tHang
+  check('手动采集：服务挂起时有界返回（不挂死）', msHang < 15000, msHang + 'ms')
+  const cacheHang = poolColdHang.stateCaches.get('sess-HANG')
+  const entriesHang = (cacheHang && Array.isArray(cacheHang.entries)) ? cacheHang.entries : []
+  // 要么给出「有失败原因的条目」，要么显式 null（HTTP 层会转成 error 让按钮显示原因）——
+  // 两种都是「有信号」，绝不允许「返回了但没有任何解释」。
+  check('手动采集：失败有信号（失败条目带原因，或显式 null）',
+    rHang === null || entriesHang.length === 0 || entriesHang.some(e => e.ok === false),
+    JSON.stringify({ rHangNull: rHang === null, entries: entriesHang }).slice(0, 240))
   poolColdHang.stop()
   sColdHang.server.closeAllConnections?.()
   sColdHang.close()
   fsp.rm(dataFile + '.coldhang', { force: true }).catch(() => {})
-
-  const poolNoWait = createPool(ctx, {
-    services: [{ id: 'SNW', name: 'n', url: 'http://127.0.0.1:9/mcp' }],
-    dataFile: dataFile + '.coldoff',
-    probeIntervalMs: 600000, stateFirstTurnWaitMs: 0,
-  })
-  poolNoWait.setStateSwitch('sess-NW', 'stateEnabled', true)
-  poolNoWait.setStateSwitch('sess-NW', 'stateSelection', true)
-  const tNoWait = Date.now()
-  const rNoWait = await poolNoWait.ensureStateTextForTurn('sess-NW', 1)
-  check('冷启动：stateFirstTurnWaitMs=0 关闭补齐（立即返回）', rNoWait === '' && Date.now() - tNoWait < 100, (Date.now() - tNoWait) + 'ms')
-  poolNoWait.stop()
-  fsp.rm(dataFile + '.coldoff', { force: true }).catch(() => {})
 }
 
 poolState.stop(); poolTiny.stop(); poolNoSnap.stop()
