@@ -857,6 +857,42 @@ check('v0.5.0：已绑定会话调 umcp_manage_scene 成功 active=ProjB', umcpR
   poolF.stop()
   check('v0.5.0：stop() 注销全部原生工具（disposer 均被调用）', poolF.nativeDisposers.size === 0 && poolF.nativeToolOwner.size === 0, 'regs=' + poolF.nativeDisposers.size + ' owner=' + poolF.nativeToolOwner.size)
 }
+// nativeToolAllowlist（白名单收窄原生工具 schema；空数组 = 全量旧行为）
+{
+  const baseline = []
+  const ctxB = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { baseline.push(def); return () => {} } } }
+  const poolB = createPool(ctxB, {
+    services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }],
+    dataFile: dataFile + '.allow-empty',
+    probeIntervalMs: 5000,
+  })
+  await poolB.probe()
+  await poolB.bind('sess-AL0')
+  const baselineNames = baseline.map(t => t.name)
+  check('allowlist：空数组 = 全量注册（旧行为不变）', baselineNames.includes('umcp_manage_scene') && baselineNames.includes('umcp_manage_gameobject') && baselineNames.length >= 4, baselineNames.join(','))
+  check('allowlist：config 默认空数组', Array.isArray(Config({}).nativeToolAllowlist) && Config({}).nativeToolAllowlist.length === 0, JSON.stringify(Config({}).nativeToolAllowlist))
+  poolB.stop()
+
+  const narrowed = []
+  const ctxN = { logger: { info() {}, warn() {}, error() {} }, tools: { register(def) { narrowed.push(def); return () => {} } } }
+  const poolN = createPool(ctxN, {
+    services: [{ id: 'S1', name: '服务1', url: 'http://127.0.0.1:' + s1.port() + '/mcp' }],
+    dataFile: dataFile + '.allow-set',
+    probeIntervalMs: 5000,
+    nativeToolAllowlist: ['manage_scene'],
+  })
+  await poolN.probe()
+  await poolN.bind('sess-AL1')
+  const narrowedNames = narrowed.map(t => t.name)
+  check('allowlist：只注册列表内工具', narrowedNames.length === 1 && narrowedNames[0] === 'umcp_manage_scene', narrowedNames.join(','))
+  check('allowlist：列表外的工具不注册', !narrowedNames.includes('umcp_manage_gameobject'), narrowedNames.join(','))
+  check('allowlist：view.rules 暴露 allowlist', Array.isArray(poolN.view().rules.nativeToolAllowlist) && poolN.view().rules.nativeToolAllowlist[0] === 'manage_scene', JSON.stringify(poolN.view().rules.nativeToolAllowlist))
+  // 收窄后代理通道必须仍可用：未注册的原生工具走 unity_mcp 转发
+  const proxyRes = await poolN.proxyMcp('sess-AL1', 'manage_gameobject', { action: 'find' })
+  check('allowlist：列表外工具仍可经 unity_mcp 代理调用', proxyRes && proxyRes.success === true, JSON.stringify(proxyRes).slice(0, 200))
+  poolN.stop()
+  check('allowlist：stop() 后无残留', poolN.nativeDisposers.size === 0 && poolN.nativeToolOwner.size === 0, 'disposers=' + poolN.nativeDisposers.size)
+}
 // 同名刷新 + 跨服务同名接管（S1/S2 都有 manage_scene；S2 绑定后接管 umcp_manage_scene）
 {
   const reg2 = []
